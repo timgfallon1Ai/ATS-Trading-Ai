@@ -1,0 +1,174 @@
+services:
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+    container_name: ats_dashboard
+    ports:
+      - "8080:80"
+    environment:
+      DASHBOARD_ENV: prod
+      REDIS_URL: redis://redis:6379
+      DASHBOARD_API_URL: wss://your-production-endpoint
+      DB_PATH: /app/data/performance.db
+    depends_on:
+      - redis
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:80/health/live" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ats_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  aar_agent:
+    build:
+      context: ./services/aar_agent
+      dockerfile: Dockerfile
+    container_name: ats_aar_agent
+    environment:
+      REDIS_URL: redis://redis:6379
+      AAR_SAVE_PATH: /app/data/backtesting_history
+      PYTHONPATH: "/app"
+    volumes:
+      - history_data:/app/data/backtesting_history
+    depends_on:
+      - redis
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+
+  backtester:
+    build:
+      context: ./services/backtester
+      dockerfile: Dockerfile
+    command: [ "python", "/app/runner.py" ]
+    container_name: ats_backtester
+    volumes:
+      - ./services/backtester:/app
+      - history_data:/app/data/backtesting_history
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=ats_redis
+    depends_on:
+      - redis
+    networks:
+      - default
+    ports:
+      - "8003:8003"
+
+  scout:
+    build:
+      context: .
+      dockerfile: services/scout/Dockerfile
+    container_name: ats_scout
+    environment:
+      REDIS_URL: redis://redis:6379
+      SCOUT_INTERVAL: "30"
+      PYTHONPATH: "/app"
+    depends_on:
+      - redis
+    networks:
+      - default
+    ports:
+      - "8004:8004"
+    restart: unless-stopped
+
+  trader:
+    build:
+      context: .
+      dockerfile: services/trader/Dockerfile
+    container_name: ats_trader
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - scout
+    environment:
+      REDIS_URL: redis://redis:6379
+      TRADER_LOOP_INTERVAL: 5
+      SCOUT_SIGNAL_FRESHNESS: 120
+      TRADER_RISK_LIMIT: 0.02
+      TRADER_POSITION_SIZE: 100
+      PYTHONPATH: "/app"
+    working_dir: /app/services/trader
+    command: [ "python", "-m", "services.trader.trader" ]
+
+  analyst:
+    build:
+      context: .
+      dockerfile: services/analyst/Dockerfile
+    container_name: ats_analyst
+    environment:
+      REDIS_URL: redis://redis:6379
+      ANALYST_LOG_LEVEL: INFO
+      ANALYST_SCHEMA_VERSION: "2.0"
+      ANALYST_MODEL_VERSION: "1.0.0"
+      ANALYST_OUTPUT_METADATA: "true"
+      PYTHONPATH: "/app"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    working_dir: /app/services/analyst
+    command: [ "python", "-m", "services.analyst.strategy_manager" ]
+
+  aggregator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/aggregator/aggregator.py
+    container_name: ats_aggregator
+    depends_on:
+      - redis
+    restart: always
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+
+  risk_manager:
+    container_name: ats_risk_manager
+    build:
+      context: .
+      dockerfile: services/risk_manager/Dockerfile
+    volumes:
+      - ./services/risk_manager:/app/services/risk_manager
+    command: [ "python", "-m", "services.risk_manager.governance_update_job" ]
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: redis://redis:6379
+      PYTHONPATH: "/app"
+    restart: always
+
+  execution_router:
+    build:
+      context: .
+      dockerfile: services/execution/Dockerfile
+    container_name: ats_execution_router
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: redis://redis:6379
+      PYTHONPATH: "/app"
+    working_dir: /app/services/execution
+    command: [ "python", "execution_router.py" ]
+
+volumes:
+  redis-data:
+  history_data:
+
+
+networks:
+  default:
+    driver: bridge

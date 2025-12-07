@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-2xl mb-4">Equity Curve</h2>
+<canvas id="equityChart" width="900" height="400"></canvas>
+
+<script>
+const timestamps = {{ timestamps | tojson }};
+const values = {{ values | tojson }};
+renderEquityChart("equityChart", timestamps, values);
+</script>
+{% endblock %}

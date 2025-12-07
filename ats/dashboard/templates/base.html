@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ATS Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/static/htmx.min.js"></script>
+    <script src="/static/charts.js"></script>
+</head>
+<body class="bg-gray-100 text-gray-900">
+    <nav class="p-4 bg-gray-800 text-white flex gap-6">
+        <a href="/" class="hover:underline">Overview</a>
+        <a href="/equity" class="hover:underline">Equity</a>
+        <a href="/executions" class="hover:underline">Executions</a>
+        <a href="/posture" class="hover:underline">Posture</a>
+        <a href="/governance" class="hover:underline">Governance</a>
+    </nav>
+
+    <main class="p-8">
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

@@ -1,0 +1,22 @@
+/.venv
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+dist/
+build/
+*.egg-info/
+
+# Local environment file with secrets (do not commit)
+.env
+
+# Generated diagnostics and reports
+pyright_report.json
+logs/diagnostics/*
+repo_untracked.txt
+ats/config/keys.yaml
+logs/
+logs/
+keys.yaml

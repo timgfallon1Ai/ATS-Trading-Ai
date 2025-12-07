@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-2xl mb-4">RM-4 Posture Timeline</h2>
+
+<table class="table-auto border-collapse border border-gray-400">
+    <tr class="bg-gray-300">
+        <th class="border p-2">Timestamp</th>
+        <th class="border p-2">Posture</th>
+    </tr>
+    {% for row in rows %}
+    <tr>
+        <td class="border p-2">{{ row.timestamp }}</td>
+        <td class="border p-2">{{ row.posture }}</td>
+    </tr>
+    {% endfor %}
+</table>
+{% endblock %}

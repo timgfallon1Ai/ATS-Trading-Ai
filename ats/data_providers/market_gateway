@@ -1,0 +1,86 @@
+# ats/data_providers/market_gateway.py
+from __future__ import annotations
+from typing import Dict, List, Optional
+
+from ats.data_providers.polygon_feed import PolygonFeed
+from ats.data_providers.benzinga_feed import BenzingaFeed
+from ats.data_providers.ibkr_feed import IBKRFeed
+from ats.data_providers.twitter_feed import TwitterFeed
+
+
+class MarketGateway:
+    """
+    Unified Institutional Market Data Gateway.
+    Wraps:
+    - Polygon (prices + bars)
+    - Benzinga (news + sentiment)
+    - IBKR (real-time price feed)
+    - Twitter (social sentiment)
+    """
+
+    def __init__(
+        self,
+        use_polygon: bool = True,
+        use_benzinga: bool = True,
+        use_ibkr: bool = False,
+        use_twitter: bool = False,
+    ):
+
+        self.polygon = PolygonFeed() if use_polygon else None
+        self.benzinga = BenzingaFeed() if use_benzinga else None
+        self.ibkr = IBKRFeed() if use_ibkr else None
+        self.twitter = TwitterFeed() if use_twitter else None
+
+    # ============================================================
+    # PRICE API
+    # ============================================================
+    def get_price(self, symbol: str) -> float:
+        if self.ibkr:
+            return self.ibkr.get_price(symbol)
+
+        if self.polygon:
+            return self.polygon.get_price(symbol)
+
+        raise RuntimeError("No provider available for get_price()")
+
+    def get_prices(self, symbols: List[str]) -> Dict[str, float]:
+        if self.ibkr:
+            return self.ibkr.get_prices(symbols)
+
+        if self.polygon:
+            return self.polygon.get_prices(symbols)
+
+        raise RuntimeError("No provider available for get_prices()")
+
+    # ============================================================
+    # NEWS + SENTIMENT API
+    # ============================================================
+    def get_news(self, symbols: List[str]) -> List[Dict]:
+        if self.benzinga:
+            return self.benzinga.get_news(symbols)
+
+        return []
+
+    def get_sentiment(self, symbols: List[str]) -> Dict[str, float]:
+        sentiment = {}
+
+        if self.benzinga:
+            bz_sent = self.benzinga.get_sentiment(symbols)
+            sentiment.update(bz_sent)
+
+        if self.twitter:
+            tw_sent = self.twitter.get_sentiment(symbols)
+            # merge sentiment sources
+            for sym, score in tw_sent.items():
+                sentiment[sym] = (sentiment.get(sym, 0) + score) / 2
+
+        return sentiment
+
+    # ============================================================
+    # HISTORICAL BARS
+    # ============================================================
+    def get_bars(self, symbol: str, interval: str = "1m", lookback: int = 150):
+        if self.polygon:
+            return self.polygon.get_bars(symbol, interval, lookback)
+
+        raise RuntimeError("No provider available for get_bars()")

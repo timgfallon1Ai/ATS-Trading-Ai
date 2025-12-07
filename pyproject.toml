@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ats-trading-ai"
+version = "0.1.0"
+description = "Autonomous trading system"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "Proprietary" }
+authors = [{ name = "Timothy Fallon" }]
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyyaml",
+  "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "black",
+  "ruff",
+  "mypy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = [".venv", "logs", "tests", "backtest_output"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+[tool.ruff]
+# Old-style config so the pre-commit ruff hook definitely sees it.
+line-length = 88
+select = ["E"]                 # only error codes
+ignore = ["E501", "E402"]      # ignore long lines + import-at-top complaints
+
+[tool.pytest.ini_options]
+addopts = "-q --import-mode=importlib"
+pythonpath = ["."]

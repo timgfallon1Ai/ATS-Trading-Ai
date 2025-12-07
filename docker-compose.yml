@@ -1,0 +1,68 @@
+version: "3.9"
+services:
+  scout:
+    build:
+      context: .
+      dockerfile: services/scout/Dockerfile
+    container_name: ats_scout
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: [ "scout" ]
+    volumes:
+      - ./:/app:delegated
+    depends_on:
+      - redis
+
+  trader:
+    build:
+      context: .
+      dockerfile: services/trader/Dockerfile
+    container_name: ats_trader
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: [ "trader" ]
+    volumes:
+      - ./:/app:delegated
+    depends_on:
+      - redis
+
+  deep_backtester:
+    build:
+      context: .
+      dockerfile: services/deep_backtester/Dockerfile
+    container_name: ats_deep_backtester
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: [ "deep-backtester" ]
+    volumes:
+      - ./:/app:delegated
+    depends_on:
+      - redis
+
+  analyst:
+    build:
+      context: .
+      dockerfile: services/analyst/Dockerfile
+    container_name: ats_analyst
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      # DEMO_WAIT_FOR_SCOUT removed; services use Redis pub/sub for cross-container events
+    command: [ "analyst" ]
+    volumes:
+      - ./:/app:delegated
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: ats_redis
+    ports:
+      - "6379:6379"

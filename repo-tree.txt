@@ -1,0 +1,439 @@
+# ATS-Trading-Ai Initial local + remote sync test.
+ats
+docker-compose.production.yml
+docker-compose.yml
+Dockerfile
+logs
+Makefile
+pyproject.toml
+pyright_report.json
+README.md
+repo_tree.txt
+repo-tree.txt
+run_backtest.py
+run.py
+
+./ats:
+__init__.py
+adaptation
+aggregator
+analyst
+backtest_dashboard.ipynb
+backtester
+backtester2
+config
+core
+dashboard
+data_providers
+event_bus
+live_aggregator
+live_analyst
+live_ingestion
+live_risk
+market
+orchestrator
+orchestrator.py
+risk_manager
+run
+trader
+trader_live
+types.py
+
+./ats/adaptation:
+__init__.py
+feedback_loop.py
+meta_allocator.py
+regime_adapter.py
+reputation_engine.py
+
+./ats/aggregator:
+__init__.py
+aggregator.py
+allocation_engine.py
+position_sizer.py
+
+./ats/analyst:
+ __init__.py
+analyst_dispatcher.py
+analyst_engine.py
+feature_engine.py
+feature_schema.py
+features.py
+loader.py
+registry.py
+strategies
+strategy_api.py
+strategy_base.py
+strategy_errors.py
+strategy_manager.py
+
+./ats/analyst/strategies:
+__init__.py
+arbitrage.py
+breakout.py
+earnings.py
+macro_trend.py
+mean_reversion.py
+momentum.py
+multi_factor.py
+news_sentiment.py
+pattern_recognition.py
+scalping.py
+strategy_manager.py
+swing.py
+volatility_regime.py
+
+./ats/backtester:
+__init__.py
+backtester.py
+data_loader_benzinga.py
+data_loader_polygon.py
+event_queue.py
+execution_context.py
+
+./ats/backtester2:
+__init__.py
+analytics
+backtest_config.py
+backtest_runner.py
+backtester_engine.py
+bt_contracts.py
+bt_debug_snapshot.py
+bt_reporter 2.py
+bt_reporter.py
+bt_sanity.py
+bt_trace 2.py
+bt_trace.py
+bt_validation 2.py
+bt_validation 3.py
+bt_validation.py
+context.py
+core
+data_loader 2.py
+data_loader 3.py
+data_loader.py
+data_window.py
+engine.py
+execution_bridge 2.py
+execution_bridge.py
+execution_engine.py
+execution_sim 2.py
+execution_sim.py
+execution_simulator 2.py
+execution_simulator.py
+fill_processor 2.py
+fill_processor.py
+interfaces 2.py
+interfaces.py
+io
+latency_model 2.py
+latency_model.py
+ledger 2.py
+ledger.py
+live_bindings.py
+loader 2.py
+loader.py
+metrics.py
+order_book.py
+order_builder.py
+pipeline 2.py
+pipeline.py
+portfolio 2.py
+portfolio 3.py
+portfolio_sim 2.py
+portfolio_sim.py
+portfolio_simulator 2.py
+portfolio_simulator 3.py
+portfolio_simulator.py
+portfolio_snapshot 2.py
+portfolio_snapshot.py
+portfolio_sync 2.py
+portfolio_sync.py
+portfolio.py
+position_book 2.py
+position_book_bt.py
+position_book.py
+position_intent 2.py
+position_intent.py
+position_sizer.py
+positions 2.py
+positions.py
+post_risk_combiner.py
+reporting
+risk_bridge 2.py
+risk_bridge 3.py
+risk_bridge.py
+run_backtest 2.py
+run_backtest.py
+run_bt 2.py
+run_bt.py
+run.py
+signal_router 2.py
+signal_router.py
+sim
+sizing_bridge.py
+slippage_model 2.py
+slippage_model.py
+time_context.py
+trade_router.py
+types.py
+
+./ats/backtester2/analytics:
+analytics_engine.py
+attribution.py
+portfolio_analytics.py
+trade_reconstructor.py
+trade_stats.py
+
+./ats/backtester2/core:
+bar 2.py
+bar.py
+ledger 2.py
+ledger.py
+result 2.py
+result.py
+timeline.py
+
+./ats/backtester2/io:
+__init__.py
+equity_curve_writer 2.py
+equity_curve_writer 3.py
+equity_curve_writer.py
+execution_log_writer.py
+manifest.py
+normalization.py
+position_journal 2.py
+position_journal.py
+results_writer 2.py
+results_writer 3.py
+results_writer.py
+schema.py
+ubf_loader 2.py
+ubf_loader 3.py
+ubf_loader.py
+validation 2.py
+validation.py
+
+./ats/backtester2/reporting:
+csv_exporter 2.py
+csv_exporter.py
+distribution_plot 2.py
+distribution_plot 3.py
+distribution_plot 4.py
+distribution_plot.py
+equity_plot 2.py
+equity_plot 3.py
+equity_plot.py
+heatmap_plot 2.py
+heatmap_plot 3.py
+heatmap_plot 4.py
+heatmap_plot.py
+html_report 2.py
+html_report.py
+report_builder 2.py
+report_builder 3.py
+report_builder 4.py
+report_builder.py
+trade_plot 2.py
+trade_plot 3.py
+trade_plot 4.py
+trade_plot.py
+
+./ats/backtester2/sim:
+execution 2.py
+execution.py
+fills 2.py
+fills.py
+market.py
+orders.py
+
+./ats/config:
+config_loader.py
+keys.yaml
+
+./ats/core:
+clock.py
+config.py
+logging.py
+state.py
+
+./ats/dashboard:
+__init__.py
+server.py
+static
+templates
+
+./ats/dashboard/static:
+charts.js
+htmx.min.js
+tailwind.css
+
+./ats/dashboard/templates:
+base.html
+equity.html
+executions.html
+index.html
+posture.html
+
+./ats/data_providers:
+__init__.py
+benzinga_feed.py
+ibkr_feed.py
+market_gateway
+polygon_feed.py
+twitter_feed.py
+
+./ats/event_bus:
+__init__.py
+event_bus.py
+in_memory_bus.py
+interfaces.py
+redis_bus.py
+
+./ats/live_aggregator:
+__init__.py
+live_aggregator_engine.py
+live_allocation_engine.py
+live_sizing_adapter.py
+
+./ats/live_analyst:
+__init__.py
+cross_symbol_memory.py
+live_analyst_engine.py
+live_feature_engine.py
+live_feature_schema.py
+live_signal_router.py
+live_strategy_adapter.py
+macro_enrichment.py
+sentiment_enrichment.py
+
+./ats/live_ingestion:
+benzinga_stream.py
+ibkr_stream.py
+ingestion_errors.py
+ingestion_router.py
+ingestion_state.py
+polygon_stream.py
+symbol_subscription_manager.py
+twitter_stream.py
+unified_live_bar_builder.py
+
+./ats/live_risk:
+__init__.py
+live_risk_adapter.py
+live_risk_envelope.py
+live_risk_orchestrator.py
+posture_sync.py
+volatility_guard.py
+
+./ats/market:
+market_gateway.py
+providers
+
+./ats/market/providers:
+benzinga_feed.py
+ibkr_feed.py
+polygon_feed.py
+twitter_feed.py
+
+./ats/orchestrator:
+log_writer.py
+
+./ats/risk_manager:
+__init__.py
+risk_dispatcher.py
+risk_manager.py
+rm_master
+rm_output_contract.py
+rm1_baseline
+rm2_predictive
+rm3_capital
+rm4_posture
+rm5_execution_filters
+rm6_portfolio_health
+rm7_governance
+
+./ats/risk_manager/rm_master:
+rm_input_transform.py
+
+./ats/risk_manager/rm1_baseline:
+__init__.py
+baseline_rules.py
+sanity_checks.py
+
+./ats/risk_manager/rm2_predictive:
+__init__.py
+predictive_engine.py
+regime_classifier.py
+risk_predictor.py
+volatility_model.py
+
+./ats/risk_manager/rm3_capital:
+__init__.py
+capital_allocator.py
+concentration_limits.py
+exposure_rules.py
+
+./ats/risk_manager/rm4_posture:
+__init__.py
+drift_detector.py
+rm4_agent.py
+rm4_anomaly_detector.py
+rm4_posture.py
+rm4_state_machine.py
+
+./ats/risk_manager/rm5_execution_filters:
+__init__.py
+fills_model.py
+latency_model.py
+slippage_model.py
+
+./ats/risk_manager/rm6_portfolio_health:
+__init__.py
+portfolio_scoring.py
+portfolio_state.py
+strategy_reputation.py
+
+./ats/risk_manager/rm7_governance:
+__init__.py
+governance_bus.py
+governance_state.py
+
+./ats/run:
+__init__ 2.py
+__init__ 3.py
+__init__.py
+boot 2.py
+boot 3.py
+boot.py
+orchestrator 2.py
+orchestrator.py
+service_registry 2.py
+service_registry.py
+system_clock 2.py
+system_clock.py
+
+./ats/trader:
+__init__.py
+execution_engine.py
+execution_simulator 2.py
+execution_simulator.py
+fill_types.py
+market_data.py
+order_types.py
+portfolio.py
+position_book.py
+trade_ledger.py
+trader.py
+
+./ats/trader_live:
+__init__.py
+latency_model.py
+live_execution_engine.py
+live_market_data.py
+live_order_router.py
+live_position_book.py
+order_converter.py
+portfolio_equity.py
+slippage_model.py
+trade_loop.py
