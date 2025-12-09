@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from typing import Any, List, Dict
 import heapq
 
+
 @dataclass(order=True)
 class Event:
     timestamp: float
     type: str
     data: Dict[str, Any]
+
 
 class EventQueue:
     """

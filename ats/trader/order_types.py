@@ -1,35 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Literal
+
+Side = Literal["buy", "sell"]
+OrderType = Literal["market"]
 
 
 @dataclass
 class Order:
     """
-    Thin institutional order abstraction.
+    Minimal order object consumed by the T1 trader.
 
-    - symbol: ticker, e.g. "AAPL"
+    - symbol: ticker (e.g. "AAPL")
     - side: "buy" or "sell"
-    - size: number of shares (positive)
-    - price: optional limit/reference price
-    - timestamp: when the order was created
+    - size: number of shares (must be positive)
+    - order_type: currently only "market"
+    - meta: free-form metadata (strategy id, tags, etc.)
     """
 
     symbol: str
-    side: str  # "buy" or "sell"
+    side: Side
     size: float
-    price: Optional[float] = None
-    timestamp: Optional[datetime] = None
+    order_type: OrderType = "market"
+    meta: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.side = self.side.lower()
-        if self.side not in {"buy", "sell"}:
-            raise ValueError("Order.side must be 'buy' or 'sell'")
-
         if self.size <= 0:
             raise ValueError("Order.size must be positive")
-
-        if self.timestamp is None:
-            self.timestamp = datetime.utcnow()
+        if self.side not in ("buy", "sell"):
+            raise ValueError(f"Invalid side: {self.side!r}")

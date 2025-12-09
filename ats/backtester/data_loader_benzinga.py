@@ -3,6 +3,7 @@
 import requests
 import datetime as dt
 
+
 class BenzingaNewsLoader:
     """
     Loads timestamped news events for a symbol.
@@ -22,18 +23,20 @@ class BenzingaNewsLoader:
                 "symbols": symbol,
                 "published_since": start,
                 "published_until": end,
-            }
+            },
         )
         data = resp.json()
         events = []
 
         for n in data:
             ts = dt.datetime.fromisoformat(n["created"]).timestamp()
-            events.append({
-                "timestamp": ts,
-                "headline": n["title"],
-                "summary": n.get("description", ""),
-                "sentiment": n.get("sentiment", {}).get("value", 0.0),
-            })
+            events.append(
+                {
+                    "timestamp": ts,
+                    "headline": n["title"],
+                    "summary": n.get("description", ""),
+                    "sentiment": n.get("sentiment", {}).get("value", 0.0),
+                }
+            )
 
         return events

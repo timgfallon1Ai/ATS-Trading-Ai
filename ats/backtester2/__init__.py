@@ -1,14 +1,19 @@
-from __future__ import annotations
-
 """
-ats.backtester2
+Backtester v2 core.
 
-Backtest v2 package.
+This module provides a thin, stable interface for running backtests
+programmatically or via:
 
-For now, we expose only the simple runner used by `python -m ats.backtester2.run`.
-The richer engine / interfaces are considered internal and may evolve.
+    python -m ats.backtester2.run --symbol AAPL
+
+The key types exported are:
+
+- BacktestConfig: Configuration for a single backtest run.
+- BacktestEngine: The core engine that loops over bars and calls Trader.
+- BacktestResult: Container for trade and portfolio history.
 """
 
-from .run import main, run_backtest
+from .backtest_config import BacktestConfig
+from .engine import BacktestEngine, BacktestResult
 
-__all__ = ["main", "run_backtest"]
+__all__ = ["BacktestConfig", "BacktestEngine", "BacktestResult"]

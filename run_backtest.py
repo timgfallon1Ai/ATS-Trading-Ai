@@ -100,11 +100,14 @@ def main():
     os.makedirs("backtest_output", exist_ok=True)
 
     print("💾 Writing results → backtest_output/")
-    pd.DataFrame(results["portfolio"]).to_csv("backtest_output/portfolio.csv", index=False)
+    pd.DataFrame(results["portfolio"]).to_csv(
+        "backtest_output/portfolio.csv", index=False
+    )
     pd.DataFrame(results["trades"]).to_csv("backtest_output/trades.csv", index=False)
 
     # RM packets are nested dicts → save JSON
     import json
+
     with open("backtest_output/rm_packets.json", "w") as f:
         json.dump(results["rm_packets"], f, indent=2)
 

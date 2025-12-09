@@ -1,156 +1,193 @@
 from __future__ import annotations
 
 import argparse
-import csv
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Iterable, List, Optional
+import math
+from datetime import datetime, timedelta
+from typing import Iterable, List, Sequence
 
-from ats.trader.order_types import Order
 from ats.trader.trader import Trader
+from ats.trader.order_types import Order
+from ats.risk_manager import RiskConfig, RiskManager
+
+from .backtest_config import BacktestConfig
+from .engine import BacktestEngine, BacktestResult
+from .types import Bar
 
 
-@dataclass
-class Bar:
-    timestamp: datetime
-    symbol: str
-    close: float
-
-
-def load_bars_from_csv(path: Path, symbol: str) -> List[Bar]:
+def generate_synthetic_bars(
+    symbol: str,
+    days: int = 200,
+    start_price: float = 100.0,
+) -> List[Bar]:
     """
-    Minimal CSV loader.
+    Generate a simple, deterministic synthetic price series.
 
-    Expects a CSV with at least:
-        timestamp,symbol,close
-
-    - timestamp: ISO string or any format parseable by datetime.fromisoformat
-    - symbol: ticker
-    - close: float
+    We use a slow sinusoidal pattern plus a mild trend to make sure
+    the strategy has something to react to, but keep it deterministic
+    so runs are reproducible.
     """
     bars: List[Bar] = []
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("symbol") != symbol:
-                continue
-            ts_raw = row.get("timestamp") or row.get("time") or row.get("date")
-            if not ts_raw:
-                continue
-            try:
-                ts = datetime.fromisoformat(ts_raw)
-            except Exception:
-                # Fallback: keep as string, we mostly care about order
-                ts = datetime.strptime(ts_raw, "%Y-%m-%d")
-            close = float(row["close"])
-            bars.append(Bar(timestamp=ts, symbol=symbol, close=close))
-    bars.sort(key=lambda b: b.timestamp)
+
+    start_dt = datetime(2025, 1, 1, 9, 30)
+
+    price = start_price
+    for i in range(days):
+        t = i / 20.0  # frequency of the sine wave
+        drift = 0.05 * i  # slow upward drift
+        delta = 2.0 * math.sin(t)
+        close = max(1.0, price + delta + drift / 100.0)
+
+        high = close + 0.5
+        low = max(0.5, close - 0.5)
+        open_ = (high + low) / 2.0
+        volume = 1_000 + i * 10
+
+        ts = (start_dt + timedelta(days=i)).isoformat()
+
+        bars.append(
+            Bar(
+                timestamp=ts,
+                symbol=symbol,
+                open=open_,
+                high=high,
+                low=low,
+                close=close,
+                volume=volume,
+            )
+        )
+
+        price = close
+
     return bars
 
 
-def generate_synthetic_bars(symbol: str, n: int = 50) -> List[Bar]:
-    """Fallback: simple synthetic walk if no CSV is provided."""
-    price = 100.0
-    bars: List[Bar] = []
-    ts = datetime.utcnow()
-    for i in range(n):
-        # deterministic-ish walk
-        price *= 1.0 + (0.01 if i % 5 == 0 else -0.005)
-        bars.append(Bar(timestamp=ts, symbol=symbol, close=price))
-        ts = ts.replace(second=(ts.second + 1) % 60)
-    return bars
-
-
-def simple_strategy(bars: Iterable[Bar]) -> Iterable[List[Order]]:
+class SimpleMAStrategy:
     """
-    Example strategy:
+    Very simple moving-average crossover-like strategy.
 
-    - First bar: buy 10 shares.
-    - Last bar: sell all.
-    - Otherwise: hold.
+    - Maintains a rolling price window (lookback).
+    - Goes long when price is above the moving average.
+    - Exits to flat when price is below the moving average.
+
+    This is only for proving the data -> strategy -> Trader -> risk ->
+    result pipeline works end-to-end. We'll replace/extend this with real
+    strategies as we move toward production.
     """
-    bars = list(bars)
-    n = len(bars)
-    if n == 0:
-        return []
 
-    orders_per_bar: List[List[Order]] = [[] for _ in range(n)]
+    def __init__(self, lookback: int = 20, unit_size: int = 10) -> None:
+        self.lookback = lookback
+        self.unit_size = unit_size
+        self._prices: List[float] = []
+        self._position: int = 0  # current number of shares
 
-    # Buy on first bar
-    first = bars[0]
-    orders_per_bar[0] = [Order(symbol=first.symbol, side="buy", size=10)]
+    def __call__(self, bar: Bar, trader: Trader) -> Sequence[Order]:
+        self._prices.append(bar.close)
 
-    # Sell all on last bar; actual size will be computed based on portfolio state
-    last = bars[-1]
-    orders_per_bar[-1] = [Order(symbol=last.symbol, side="sell", size=10)]
+        if len(self._prices) < self.lookback:
+            return []
 
-    return orders_per_bar
+        window = self._prices[-self.lookback :]
+        ma = sum(window) / len(window)
+
+        orders: List[Order] = []
+
+        # Long when price > MA, flat when price < MA.
+        if bar.close > ma and self._position <= 0:
+            # Increase position to +unit_size
+            target = self.unit_size
+            delta = target - self._position
+            if delta > 0:
+                orders.append(Order(symbol=bar.symbol, side="buy", size=float(delta)))
+                self._position += delta
+
+        elif bar.close < ma and self._position > 0:
+            # Exit any existing long position
+            delta = self._position
+            orders.append(Order(symbol=bar.symbol, side="sell", size=float(delta)))
+            self._position -= delta
+
+        return orders
 
 
 def run_backtest(
     symbol: str,
-    csv_path: Optional[Path],
-    starting_capital: float = 1_000.0,
-) -> None:
-    if csv_path is not None and csv_path.exists():
-        bars = load_bars_from_csv(csv_path, symbol=symbol)
+    days: int = 200,
+    enable_risk: bool = True,
+) -> BacktestResult:
+    """
+    Convenience function for running a backtest programmatically.
+    """
+
+    config = BacktestConfig(symbol=symbol)
+    trader = Trader(starting_capital=config.starting_capital)
+
+    bars = generate_synthetic_bars(symbol=symbol, days=days)
+    strategy = SimpleMAStrategy()
+
+    risk_manager: RiskManager | None
+    if enable_risk:
+        risk_cfg = RiskConfig()
+        risk_manager = RiskManager(config=risk_cfg)
     else:
-        bars = generate_synthetic_bars(symbol=symbol, n=50)
+        risk_manager = None
 
-    if not bars:
-        print("No bars loaded; nothing to backtest.")
-        return
+    engine = BacktestEngine(
+        config=config,
+        trader=trader,
+        bars=bars,
+        strategy=strategy,
+        risk_manager=risk_manager,
+    )
 
-    trader = Trader(starting_capital=starting_capital)
-    orders_per_bar = list(simple_strategy(bars))
-
-    print(f"Running backtest for {symbol} with {len(bars)} bars...")
-    for bar, orders in zip(bars, orders_per_bar):
-        trader.update_market({bar.symbol: bar.close})
-        res = trader.process_orders(orders)
-        portfolio = res["portfolio"]
-        print(
-            f"{bar.timestamp.isoformat()}  "
-            f"px={bar.close:.2f}  "
-            f"equity={portfolio['equity']:.2f}  "
-            f"cash={portfolio['cash']:.2f}  "
-            f"pos={portfolio['positions']}"
-        )
-
-    final_snapshot = trader.portfolio.snapshot({bars[-1].symbol: bars[-1].close})
-    print("\n=== Backtest complete ===")
-    print(f"Final equity: {final_snapshot['equity']:.2f}")
-    print(f"Realized PnL: {final_snapshot['realized_pnl']:.2f}")
-    print(f"Positions: {final_snapshot['positions']}")
+    return engine.run()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run backtest2 using T1 Trader.")
-    parser.add_argument(
-        "--symbol", type=str, default="AAPL", help="Symbol to backtest."
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run a simple synthetic backtest using ats.backtester2.",
     )
     parser.add_argument(
-        "--csv",
-        type=str,
-        default="",
-        help="Optional path to CSV with columns [timestamp,symbol,close].",
+        "--symbol",
+        required=True,
+        help="Symbol to backtest (e.g. AAPL).",
     )
     parser.add_argument(
-        "--capital",
-        type=float,
-        default=1_000.0,
-        help="Starting capital for the portfolio.",
+        "--days",
+        type=int,
+        default=200,
+        help="Number of synthetic daily bars to generate (default: 200).",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--no-risk",
+        action="store_true",
+        help="Disable the baseline RiskManager for this run.",
+    )
 
-    csv_path = Path(args.csv) if args.csv else None
-    run_backtest(
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    result = run_backtest(
         symbol=args.symbol,
-        csv_path=csv_path,
-        starting_capital=args.capital,
+        days=args.days,
+        enable_risk=not args.no_risk,
     )
+
+    print(f"Backtest complete for {result.config.symbol}")
+    print(f"Bars processed: {args.days}")
+    print(f"Trades executed: {len(result.trade_history)}")
+
+    if result.final_portfolio is not None:
+        print("Final portfolio snapshot:")
+        print(result.final_portfolio)
+    else:
+        print("No trades were executed; no final portfolio snapshot available.")
+
+    if result.risk_decisions:
+        blocked = sum(len(d.rejected_orders) for d in result.risk_decisions)
+        print(f"Risk manager evaluated {len(result.risk_decisions)} bars.")
+        print(f"Orders blocked by risk: {blocked}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -4,12 +4,15 @@ import requests
 import pandas as pd
 import datetime as dt
 
+
 class PolygonDataLoader:
     """
     Loads 1-minute historical bars from Polygon using the configured API key.
     """
 
-    BASE_URL = "https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start}/{end}"
+    BASE_URL = (
+        "https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start}/{end}"
+    )
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -24,12 +27,15 @@ class PolygonDataLoader:
 
         df = pd.DataFrame(data["results"])
         df["timestamp"] = df["t"] / 1000.0  # ms → seconds
-        df.rename(columns={
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
-        }, inplace=True)
+        df.rename(
+            columns={
+                "o": "open",
+                "h": "high",
+                "l": "low",
+                "c": "close",
+                "v": "volume",
+            },
+            inplace=True,
+        )
 
         return df[["timestamp", "open", "high", "low", "close", "volume"]]

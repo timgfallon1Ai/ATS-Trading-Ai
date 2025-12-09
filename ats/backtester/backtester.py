@@ -7,6 +7,7 @@ import datetime as dt
 from ats.backtester.event_queue import EventQueue
 from ats.backtester.execution_context import ExecutionContext
 
+
 class Backtester:
     """
     Z-12 Backtester (L2 Output)

@@ -2,6 +2,7 @@
 
 from typing import Dict, Any
 
+
 class ExecutionContext:
     """
     Holds persistent state for the backtest:

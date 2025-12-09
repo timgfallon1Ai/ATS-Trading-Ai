@@ -1,13 +1,18 @@
-"""ATS Institutional Risk Manager (RM-1 → RM-7)
+"""
+Risk management layer for the ATS.
 
-Provides a fully modular, multi-layer risk engine:
-- Baseline safety checks
-- Predictive risk & regimes
-- Capital exposure rules
-- Posture & anomaly detection (RM-4)
-- Execution filters
-- Portfolio health scoring
-- Governance & audit logging
+Phase 3 baseline exposes a simple, numeric risk manager that can be
+used by both backtests and live trading:
+
+- RiskConfig: configuration for basic per-order limits.
+- RiskDecision: result of evaluating a batch of orders.
+- RiskManager: engine that applies the config to incoming orders.
+
+The interface is intentionally small and stable so more advanced
+risk modules (RM2, RM3, RM4, etc.) can be layered in later without
+breaking existing call sites.
 """
 
-from .risk_manager import RiskManager
+from .risk_manager import RiskConfig, RiskDecision, RiskManager
+
+__all__ = ["RiskConfig", "RiskDecision", "RiskManager"]

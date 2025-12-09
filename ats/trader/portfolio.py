@@ -1,110 +1,116 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Dict
 
-from ats.trader.fill_types import Fill
+from .fill_types import Fill
+from .position_book import Position, PositionBook
 
 
 @dataclass
 class Portfolio:
     """
-    Simple long-only portfolio model.
+    Simple long-only portfolio.
 
     Tracks:
-    - starting_capital
     - cash
-    - per-symbol positions
-    - per-symbol average entry prices
-    - realized PnL
+    - realized_pnl
+    - positions
     """
 
-    starting_capital: float = 1000.0
+    starting_cash: float = 100_000.0
     cash: float = field(init=False)
-    positions: Dict[str, float] = field(default_factory=dict)
-    avg_price: Dict[str, float] = field(default_factory=dict)
-    realized_pnl: float = 0.0
+    realized_pnl: float = field(init=False)
+    positions: PositionBook = field(init=False)
 
     def __post_init__(self) -> None:
-        self.cash = float(self.starting_capital)
+        self.cash = float(self.starting_cash)
+        self.realized_pnl = 0.0
+        self.positions = PositionBook()
 
     # ------------------------------------------------------------------ #
-    # Fills / PnL
+    # Fill application
     # ------------------------------------------------------------------ #
-    def apply_fill(self, fill: Fill) -> float:
-        """
-        Apply a fill to the portfolio and return the realized PnL
-        associated with this fill.
 
-        Assumes long-only semantics:
-        - BUY increases position and reduces cash.
-        - SELL reduces position, realizes PnL vs avg_price, increases cash.
-        """
-        symbol = fill.symbol
-        side = fill.side.lower()
-        size = float(fill.size)
-        price = float(fill.price)
+    def apply_fill(self, fill: Fill) -> None:
+        """Update cash, positions, and realized PnL for a single fill."""
+        pos = self.positions.get(fill.symbol)
 
-        if size <= 0:
-            raise ValueError("Fill.size must be positive")
+        if fill.side == "buy":
+            # Opening or adding to a long position
+            total_qty = pos.quantity + fill.size
+            if total_qty <= 0:
+                # Strange edge case; treat as flat
+                pos.quantity = 0.0
+                pos.avg_price = 0.0
+            else:
+                total_cost = pos.quantity * pos.avg_price + fill.size * fill.price
+                pos.quantity = total_qty
+                pos.avg_price = total_cost / total_qty
 
-        pos = self.positions.get(symbol, 0.0)
+            self.cash -= fill.size * fill.price
 
-        if side == "buy":
-            cost = price * size
-            self.cash -= cost
+        else:  # sell
+            if pos.quantity <= 0:
+                # Selling when flat or short is unsupported in this simple model.
+                raise ValueError(
+                    f"Cannot sell {fill.size} of {fill.symbol} with quantity {pos.quantity}"
+                )
 
-            new_pos = pos + size
-            prev_cost = self.avg_price.get(symbol, 0.0) * pos
-            new_cost = prev_cost + cost
+            if fill.size > pos.quantity:
+                raise ValueError(
+                    f"Sell size {fill.size} exceeds position quantity {pos.quantity}"
+                )
 
-            self.positions[symbol] = new_pos
-            self.avg_price[symbol] = new_cost / new_pos if new_pos else 0.0
+            # Realized PnL = (sell price - avg_price) * quantity sold
+            pnl = (fill.price - pos.avg_price) * fill.size
+            self.realized_pnl += pnl
 
-            realized_pnl = 0.0
+            pos.quantity -= fill.size
+            self.cash += fill.size * fill.price
 
-        elif side == "sell":
-            exit_value = price * size
-            self.cash += exit_value
+            if pos.quantity == 0:
+                pos.avg_price = 0.0
 
-            entry_price = self.avg_price.get(symbol, price)
-            realized_pnl = (price - entry_price) * size
-            self.realized_pnl += realized_pnl
-
-            new_pos = pos - size
-            self.positions[symbol] = new_pos
-            if new_pos <= 0:
-                self.avg_price.pop(symbol, None)
-
-        else:
-            raise ValueError("Fill.side must be 'buy' or 'sell'")
-
-        return realized_pnl
+    def apply_fills(self, fills: list[Fill]) -> None:
+        """Apply a batch of fills."""
+        for fill in fills:
+            self.apply_fill(fill)
 
     # ------------------------------------------------------------------ #
-    # Equity & snapshots
+    # Valuation
     # ------------------------------------------------------------------ #
-    def equity(self, market_prices: Dict[str, float]) -> float:
-        """Return total equity = cash + unrealized PnL."""
-        unrealized = 0.0
-        for sym, qty in self.positions.items():
-            price = market_prices.get(sym)
-            if price is None:
-                # no quote → assume zero contribution for now
+
+    def equity(self, prices: Dict[str, float]) -> float:
+        """Return total equity = cash + sum(quantity * price)."""
+        value = self.cash
+        for symbol, pos in self.positions.all().items():
+            if pos.quantity == 0:
                 continue
-            cost = self.avg_price.get(sym, price)
-            unrealized += (price - cost) * qty
-        return self.cash + unrealized
+            px = prices.get(symbol, pos.avg_price)
+            value += pos.quantity * px
+        return value
 
-    def snapshot(self, market_prices: Dict[str, float]) -> Dict[str, Any]:
-        """
-        Return a JSON-serializable snapshot of the portfolio.
-        """
+    # ------------------------------------------------------------------ #
+    # Serialization
+    # ------------------------------------------------------------------ #
+
+    def snapshot(self, prices: Dict[str, float]) -> Dict[str, object]:
+        """Return a JSON-serializable snapshot of portfolio state."""
+        positions = {
+            symbol: {
+                "quantity": pos.quantity,
+                "avg_price": pos.avg_price,
+            }
+            for symbol, pos in self.positions.all().items()
+            if pos.quantity != 0
+        }
+
+        equity = self.equity(prices)
+
         return {
-            "starting_capital": self.starting_capital,
             "cash": self.cash,
-            "positions": dict(self.positions),
-            "avg_price": dict(self.avg_price),
             "realized_pnl": self.realized_pnl,
-            "equity": self.equity(market_prices),
+            "equity": equity,
+            "positions": positions,
         }

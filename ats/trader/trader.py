@@ -1,85 +1,97 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, TypedDict
 
-from ats.trader.execution_engine import ExecutionEngine
-from ats.trader.fill_types import Fill
-from ats.trader.market_data import MarketData
-from ats.trader.order_types import Order
-from ats.trader.portfolio import Portfolio
-from ats.trader.trade_ledger import TradeLedger
+from .execution_engine import ExecutionEngine
+from .fill_types import Fill
+from .market_data import MarketData
+from .order_types import Order
+from .portfolio import Portfolio
+from .trade_ledger import TradeLedger
+
+
+class TraderSnapshot(TypedDict):
+    fills: List[Dict[str, object]]
+    portfolio: Dict[str, object]
+    trade_history: List[Dict[str, object]]
+
+
+def _fill_to_dict(fill: Fill) -> Dict[str, object]:
+    return {
+        "symbol": fill.symbol,
+        "side": fill.side,
+        "size": fill.size,
+        "price": fill.price,
+        "timestamp": fill.timestamp.isoformat(),
+        "notional": fill.notional,
+    }
 
 
 class Trader:
     """
-    T1 - Thin Institutional Trader.
+    T1 - Thin trader.
 
     Responsibilities:
-    - Hold the current market data snapshot.
-    - Accept final risk-managed Orders.
-    - Call the ExecutionEngine to obtain Fills.
-    - Update the Portfolio and TradeLedger.
-    - Return a JSON-friendly dict of fills + portfolio state.
+    - Hold MarketData snapshot
+    - Hold Portfolio (cash + positions)
+    - Use ExecutionEngine to convert Orders → Fills
+    - Record fills in a TradeLedger
+    - Return a serializable snapshot after each batch
     """
 
-    def __init__(
-        self,
-        starting_capital: float = 1000.0,
-        exec_engine: ExecutionEngine | None = None,
-    ) -> None:
-        self.market_data = MarketData()
-        self.portfolio = Portfolio(starting_capital=starting_capital)
-        self.exec_engine = exec_engine or ExecutionEngine()
+    def __init__(self, starting_capital: float = 100_000.0) -> None:
+        self.market = MarketData()
+        self.portfolio = Portfolio(starting_cash=starting_capital)
+        self.execution = ExecutionEngine()
         self.ledger = TradeLedger()
 
     # ------------------------------------------------------------------ #
-    # Market data
+    # Market updates
     # ------------------------------------------------------------------ #
+
     def update_market(self, prices: Dict[str, float]) -> None:
-        """Update internal market snapshot."""
-        self.market_data.update(prices)
+        """Update the internal price snapshot."""
+        self.market.update(prices)
 
     # ------------------------------------------------------------------ #
-    # Trading
+    # Order processing
     # ------------------------------------------------------------------ #
-    def process_orders(self, orders: List[Order]) -> Dict[str, Any]:
+
+    def process_orders(
+        self,
+        orders: Iterable[Order],
+        timestamp: datetime | None = None,
+    ) -> TraderSnapshot:
         """
-        Execute a batch of Orders against the current market snapshot.
+        Process a batch of orders and return a snapshot.
 
-        Returns:
-            {
-              "fills": [ {symbol, side, size, price, timestamp}, ... ],
-              "portfolio": {...},
-              "trade_history": [...],
+        Steps:
+        - snapshot prices
+        - execute orders
+        - apply fills to portfolio
+        - record fills in ledger
+        - return snapshot (fills + portfolio + full history)
+        """
+        orders_list = list(orders)
+        if not orders_list:
+            prices = self.market.snapshot()
+            return {
+                "fills": [],
+                "portfolio": self.portfolio.snapshot(prices),
+                "trade_history": [_fill_to_dict(f) for f in self.ledger.history()],
             }
-        """
-        prices = self.market_data.snapshot
 
-        fills = self.exec_engine.execute(orders, prices)
-        for fill in fills:
-            realized = self.portfolio.apply_fill(fill)
-            if realized != 0.0:
-                self.ledger.record(fill, realized)
+        prices = self.market.snapshot()
+        ts = timestamp or datetime.now(timezone.utc)
 
-        snapshot = self.portfolio.snapshot(prices)
+        fills = self.execution.execute(orders_list, prices, ts)
+        self.portfolio.apply_fills(fills)
+        self.ledger.record(fills)
 
-        return {
-            "fills": [self._fill_to_dict(f) for f in fills],
-            "portfolio": snapshot,
-            "trade_history": self.ledger.to_dicts(),
+        snapshot: TraderSnapshot = {
+            "fills": [_fill_to_dict(f) for f in fills],
+            "portfolio": self.portfolio.snapshot(self.market.snapshot()),
+            "trade_history": [_fill_to_dict(f) for f in self.ledger.history()],
         }
-
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _fill_to_dict(fill: Fill) -> Dict[str, Any]:
-        return {
-            "symbol": fill.symbol,
-            "side": fill.side,
-            "size": fill.size,
-            "price": fill.price,
-            "timestamp": getattr(
-                fill.timestamp, "isoformat", lambda: str(fill.timestamp)
-            )(),
-        }
+        return snapshot

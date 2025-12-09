@@ -1,201 +1,126 @@
-# ats/backtester2/engine.py
-
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Sequence
 
-from .bt_debug_snapshot import SnapshotRecorder
-from .bt_reporter import generate_report
-from .bt_trace import BTTrace
+from ats.trader.trader import Trader
+from ats.trader.order_types import Order
+from ats.risk_manager import RiskDecision, RiskManager
+
+from .backtest_config import BacktestConfig
+from .types import Bar
 
 
-class BT2Engine:
-    """Full multi-symbol backtest engine (BT-2A).
-    Dispatcher-driven modular pipeline.
+# Strategy function signature:
+#     strategy(bar: Bar, trader: Trader) -> Sequence[Order]
+StrategyFn = Callable[[Bar, Trader], Sequence[Order]]
+
+
+@dataclass
+class BacktestResult:
+    """
+    Result of a backtest run.
+
+    - config: The BacktestConfig used for this run.
+    - portfolio_history: List of portfolio snapshots returned from Trader.
+    - trade_history: Aggregate of trade history objects returned from Trader.
+    - final_portfolio: The last portfolio snapshot, or None if no trades.
+    - risk_decisions: Optional list of RiskDecision objects, one per bar
+      where orders were evaluated by the RiskManager.
+    """
+
+    config: BacktestConfig
+    portfolio_history: List[Dict[str, Any]] = field(default_factory=list)
+    trade_history: List[Any] = field(default_factory=list)
+    final_portfolio: Dict[str, Any] | None = None
+    risk_decisions: List[RiskDecision] = field(default_factory=list)
+
+
+class BacktestEngine:
+    """
+    Minimal v2 backtest engine with baseline risk integration.
+
+    This engine:
+
+    - Iterates over a sequence of Bar objects.
+    - For each bar, updates the Trader's market prices.
+    - Calls a user-provided StrategyFn to generate orders.
+    - Optionally passes those orders through a RiskManager.
+    - Sends the accepted orders to Trader.process_orders().
+    - Records portfolio snapshots and trades from the Trader result dict.
     """
 
     def __init__(
         self,
-        dispatcher,
-        initial_equity: float = 1000.0,
-        trace_enabled: bool = False,
-        snapshot_enabled: bool = False,
-    ):
-        self.dispatcher = dispatcher
-        self.initial_equity = initial_equity
+        config: BacktestConfig,
+        trader: Trader,
+        bars: Iterable[Bar],
+        strategy: StrategyFn,
+        risk_manager: RiskManager | None = None,
+    ) -> None:
+        self.config = config
+        self.trader = trader
+        self._bars = list(bars)
+        self.strategy = strategy
+        self.risk_manager = risk_manager
 
-        self.trace = BTTrace(enabled=trace_enabled)
-        self.snapshots = SnapshotRecorder(enabled=snapshot_enabled)
+    def run(self) -> BacktestResult:
+        portfolio_history: List[Dict[str, Any]] = []
+        trade_history: List[Any] = []
+        risk_decisions: List[RiskDecision] = []
 
-        # Portfolio state (per-symbol qty)
-        self.positions: Dict[str, float] = {}
-        self.cash: float = initial_equity
+        for idx, bar in enumerate(self._bars):
+            if self.config.bar_limit is not None and idx >= self.config.bar_limit:
+                break
 
-        # Logs
-        self.trade_log: List[Dict[str, Any]] = []
-        self.equity_curve: List[float] = []
-        self.pnl_series: List[float] = []
-        self.turnover_series: List[float] = []
-        self.exposure_series: List[float] = []
+            # Mark the trader to market for this bar's close price.
+            self.trader.update_market({bar.symbol: bar.close})
 
-    # ---------------------------------------------------------------------
-    # Utility
-    # ---------------------------------------------------------------------
-    def _calc_equity(self, ts: int, bars: Dict[str, Dict[str, float]]) -> float:
-        eq = self.cash
-        for sym, qty in self.positions.items():
-            if sym in bars:
-                eq += qty * bars[sym]["close"]
-        return eq
+            # Let the strategy decide what to do at this bar.
+            orders: Sequence[Order] = self.strategy(bar, self.trader)
+            if not orders:
+                # No action for this bar.
+                continue
 
-    # ---------------------------------------------------------------------
-    # Main run loop
-    # ---------------------------------------------------------------------
-    def run(self, data: Dict[int, Dict[str, Dict[str, float]]]) -> Dict[str, Any]:
-        """data: { ts → { symbol → bar } }"""
-        for ts, symbol_bars in data.items():
-            # ============================
-            # 1) Snapshot (pre-bar)
-            # ============================
-            self.snapshots.record(
-                ts, "pre_bar", {"positions": dict(self.positions), "cash": self.cash}
-            )
+            candidate_orders = list(orders)
 
-            # ============================
-            # 2) Feature extraction
-            # ============================
-            feats = self.dispatcher.run_features(ts, symbol_bars)
-            self.trace.log(ts, "features", feats)
+            # Apply baseline risk management if present.
+            if self.risk_manager is not None:
+                decision = self.risk_manager.evaluate_orders(bar, candidate_orders)
+                safe_orders = list(decision.accepted_orders)
 
-            self.snapshots.record(ts, "features", feats)
+                # Record the decision even if no orders survive.
+                risk_decisions.append(decision)
 
-            # ============================
-            # 3) Strategy signals
-            # ============================
-            signals = self.dispatcher.run_signals(ts, feats)
-            self.trace.log(ts, "signals", signals)
-
-            self.snapshots.record(ts, "signals", signals)
-
-            # ============================
-            # 4) Risk manager (RM-4 posture)
-            # ============================
-            posture = self.dispatcher.run_risk(ts, signals)
-            self.trace.log(ts, "posture", posture)
-
-            self.snapshots.record(ts, "posture", posture)
-
-            # ============================
-            # 5) Position sizing
-            # ============================
-            weights = self.dispatcher.size_positions(ts, posture)
-            self.trace.log(ts, "weights", weights)
-
-            self.snapshots.record(ts, "weights", weights)
-
-            # ============================
-            # 6) Convert weights → target qty
-            # ============================
-            targets = {}
-            eq = self._calc_equity(ts, symbol_bars)
-            for sym, w in weights.items():
-                if sym not in symbol_bars:
+                if not safe_orders:
+                    # All orders were blocked by risk.
                     continue
-                px = symbol_bars[sym]["close"]
-                targets[sym] = (eq * w) / px if px > 0 else 0.0
+            else:
+                safe_orders = candidate_orders
 
-            self.trace.log(ts, "targets", targets)
-            self.snapshots.record(ts, "targets", targets)
+            result = self.trader.process_orders(safe_orders)
 
-            # ============================
-            # 7) Generate trades (delta between positions)
-            # ============================
-            bar_trades = {}
-            turnover_amt = 0.0
+            # We expect Trader.process_orders to return a dict-like structure,
+            # but we keep the contract loose to avoid coupling to internals.
+            if isinstance(result, dict):
+                portfolio = result.get("portfolio")
+                if portfolio is not None:
+                    portfolio_history.append(portfolio)
 
-            for sym, tgt_qty in targets.items():
-                cur_qty = self.positions.get(sym, 0.0)
-                delta = tgt_qty - cur_qty
-                if abs(delta) > 1e-9:
-                    bar_trades[sym] = delta
-                    turnover_amt += abs(delta)
+                trades = result.get("trade_history")
+                if trades:
+                    # Could be list or single object; normalize to list.
+                    if isinstance(trades, list):
+                        trade_history.extend(trades)
+                    else:
+                        trade_history.append(trades)
 
-            self.trace.log(ts, "trades", bar_trades)
+        final_portfolio = portfolio_history[-1] if portfolio_history else None
 
-            # ============================
-            # 8) Apply trades
-            # ============================
-            for sym, qty_delta in bar_trades.items():
-                px = symbol_bars[sym]["close"]
-                cost = qty_delta * px
-
-                # buy reduces cash / sell increases cash
-                self.cash -= cost
-
-                # update positions
-                self.positions[sym] = self.positions.get(sym, 0.0) + qty_delta
-
-                # trade log entry
-                self.trade_log.append(
-                    {
-                        "ts": ts,
-                        "symbol": sym,
-                        "qty": qty_delta,
-                        "price": px,
-                        "cost": cost,
-                    }
-                )
-
-            # ============================
-            # 9) End of bar equity
-            # ============================
-            eq_end = self._calc_equity(ts, symbol_bars)
-            pnl = eq_end - (
-                self.equity_curve[-1] if self.equity_curve else self.initial_equity
-            )
-
-            self.equity_curve.append(eq_end)
-            self.pnl_series.append(pnl)
-            self.turnover_series.append(turnover_amt)
-            self.exposure_series.append(
-                sum(
-                    abs(q) * symbol_bars[sym]["close"]
-                    for sym, q in self.positions.items()
-                )
-            )
-
-            self.trace.log(
-                ts,
-                "equity",
-                {
-                    "equity": eq_end,
-                    "pnl": pnl,
-                    "cash": self.cash,
-                    "positions": dict(self.positions),
-                },
-            )
-
-            self.snapshots.record(
-                ts,
-                "post_bar",
-                {
-                    "equity": eq_end,
-                    "pnl": pnl,
-                    "cash": self.cash,
-                    "positions": dict(self.positions),
-                },
-            )
-
-        # =====================================================
-        # Final backtest report
-        # =====================================================
-        per_symbol_returns = {sym: (self.positions[sym] * 0) for sym in self.positions}
-
-        return generate_report(
-            equity_curve=self.equity_curve,
-            pnl_series=self.pnl_series,
-            trades=self.trade_log,
-            per_symbol_returns=per_symbol_returns,
-            exposure_series=self.exposure_series,
-            turnover_series=self.turnover_series,
+        return BacktestResult(
+            config=self.config,
+            portfolio_history=portfolio_history,
+            trade_history=trade_history,
+            final_portfolio=final_portfolio,
+            risk_decisions=risk_decisions,
         )

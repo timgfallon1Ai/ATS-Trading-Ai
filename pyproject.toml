@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "Proprietary" }
 authors = [{ name = "Timothy Fallon" }]
+
 dependencies = [
   "numpy",
   "pandas",
@@ -34,11 +35,20 @@ line-length = 88
 target-version = ['py310']
 
 [tool.ruff]
-# Old-style config so the pre-commit ruff hook definitely sees it.
 line-length = 88
-select = ["E"]                 # only error codes
-ignore = ["E501", "E402"]      # ignore long lines + import-at-top complaints
-
+# For now, only error codes, and ignore import-position + long-line noise.
+select = ["E"]
+ignore = ["E402", "E501"]
+exclude = [
+  ".git",
+  ".venv",
+  "venv",
+  "build",
+  "dist",
+  "__pycache__",
+  "ats/backtester2",  # exclude the big WIP backtester2 tree from lint for now
+]
+ 
 [tool.pytest.ini_options]
 addopts = "-q --import-mode=importlib"
 pythonpath = ["."]
