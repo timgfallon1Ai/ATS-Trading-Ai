@@ -1,66 +1,62 @@
+# ats/analyst/strategies/momentum.py
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
-import numpy as np
+from ..registry import register_strategy
+from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
 
 
-class MomentumStrategy:
-    """Z-Ultra Momentum (F2 Depth)
-    Multi-window momentum, volatility normalization,
-    entropy gating, and regime-scaled trend conviction.
+@register_strategy
+class MomentumStrategy(StrategyBase):
+    """
+    Classic moving-average cross momentum strategy.
+
+    Long when fast MA is above slow MA, short when fast MA is below slow MA.
     """
 
-    def __init__(self):
-        pass
+    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
+        signals: List[StrategySignal] = []
 
-    def _compute_features(self, history: Dict[str, Dict]) -> Dict[str, Dict]:
-        features = {}
+        threshold = float(self.config.get("cross_threshold", 0.001))
 
-        for symbol, data in history.items():
-            closes = np.array(data["close"][-100:])
-            vol20 = np.std(closes[-20:])
-            mom20 = (closes[-1] - closes[-20]) / (closes[-20] + 1e-9)
-            mom50 = (closes[-1] - closes[-50]) / (closes[-50] + 1e-9)
+        for symbol in context.universe:
+            feats: Dict[str, float] = context.features.get(symbol, {})
+            close = float(feats.get("close", 0.0))
+            ma_fast = float(feats.get("ma_fast", close or 1.0))
+            ma_slow = float(feats.get("ma_slow", close or 1.0))
 
-            entropy = float(np.std(np.diff(closes[-15:])))
+            if ma_fast <= 0.0 or ma_slow <= 0.0:
+                continue
 
-            features[symbol] = {
-                "mom20": mom20,
-                "mom50": mom50,
-                "vol20": vol20,
-                "entropy": entropy,
-                "trend_strength": (mom20 + mom50) / (vol20 + 1e-9),
-            }
+            ratio = ma_fast / ma_slow
+            if ratio > 1.0 + threshold:
+                side = "long"
+                score = ratio - 1.0
+            elif ratio < 1.0 - threshold:
+                side = "short"
+                score = (1.0 / ratio) - 1.0
+            else:
+                continue
 
-        return features
+            size = float(self.config.get("base_size", 1.0))
 
-    def _signal(self, f: Dict[str, float], regime: str) -> float:
-        # Conviction changes dramatically by regime
-        w = {
-            "BULL": 1.6,
-            "EXPANSION": 1.2,
-            "NEUTRAL": 0.8,
-            "VOLATILE": 0.3,
-            "BEAR": -0.5,
-            "CRISIS": -1.0,
-        }[regime]
+            signals.append(
+                StrategySignal(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    score=score,
+                    confidence=min(1.0, score / threshold),
+                    strategy=self.name,
+                    timestamp=context.timestamp,
+                    metadata={
+                        "close": close,
+                        "ma_fast": ma_fast,
+                        "ma_slow": ma_slow,
+                        "ratio": ratio,
+                    },
+                )
+            )
 
-        base = f["mom20"] * 0.6 + f["mom50"] * 0.4
-        entropy_gate = max(0.0, 1.0 - f["entropy"])
-
-        return base * w * entropy_gate
-
-    def run(self, history: Dict[str, Dict], regime: str) -> Dict:
-        features = self._compute_features(history)
-        signal = {s: self._signal(f, regime) for s, f in features.items()}
-
-        pnl_est = float(np.mean(list(signal.values())))
-        vol_est = float(np.std(list(signal.values())))
-
-        return {
-            "features": features,
-            "signal": signal,
-            "pnl_estimate": pnl_est,
-            "vol_estimate": vol_est,
-        }
+        return signals

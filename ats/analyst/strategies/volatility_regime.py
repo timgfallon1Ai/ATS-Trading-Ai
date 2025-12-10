@@ -1,76 +1,71 @@
+# ats/analyst/strategies/volatility_regime.py
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
-import numpy as np
+from ats.analyst.registry import register_strategy
+from ats.analyst.strategy_api import AnalystContext, StrategyBase, StrategySignal
 
 
-class VolatilityRegimeStrategy:
-    """Z-Ultra Volatility Regime Strategy (F2 Depth)
+@register_strategy
+class VolatilityRegimeStrategy(StrategyBase):
+    """
+    Volatility-regime aware strategy.
 
-    Detects volatility expansions, compressions, entropy shifts, and
-    regime-consistent volatility normalization. Acts as a meta-strategy
-    that identifies when volatility favors trend, mean reversion,
-    breakout, or defensive postures.
+    Uses volatility normalized by price to bias positioning:
+    - Low volatility + uptrend → long.
+    - High volatility + downtrend → short.
     """
 
-    def __init__(self):
-        pass
+    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
+        signals: List[StrategySignal] = []
 
-    def _compute_features(self, history: Dict[str, Dict]) -> Dict[str, Dict]:
-        features = {}
+        low_vol_threshold = float(self.config.get("low_vol_threshold", 0.01))
+        high_vol_threshold = float(self.config.get("high_vol_threshold", 0.05))
+        trend_threshold = float(self.config.get("trend_threshold", 0.005))
 
-        for symbol, data in history.items():
-            closes = np.array(data["close"][-80:])
-            highs = np.array(data["high"][-80:])
-            lows = np.array(data["low"][-80:])
+        for symbol in context.universe:
+            feats: Dict[str, float] = context.features.get(symbol, {})
+            close = float(feats.get("close", 0.0))
+            ma_fast = float(feats.get("ma_fast", close or 1.0))
+            ma_slow = float(feats.get("ma_slow", close or 1.0))
+            vol20 = float(feats.get("volatility_20", 0.0))
 
-            vol20 = np.std(closes[-20:])
-            vol60 = np.std(closes[-60:])
-            vol_ratio = vol20 / (vol60 + 1e-9)
+            if close <= 0.0 or ma_slow <= 0.0:
+                continue
 
-            entropy20 = np.std(np.diff(closes[-20:]))
-            range_norm = (highs[-1] - lows[-1]) / (closes[-1] + 1e-9)
+            vol_norm = vol20 / max(close, 1e-9)
+            trend = (ma_fast - ma_slow) / ma_slow
 
-            features[symbol] = {
-                "vol20": vol20,
-                "vol60": vol60,
-                "vol_ratio": vol_ratio,
-                "entropy20": entropy20,
-                "range_norm": range_norm,
-                "vol_slope": (vol20 - np.std(closes[-30:]))
-                / (np.std(closes[-30:]) + 1e-9),
-            }
+            if vol_norm < low_vol_threshold and trend > trend_threshold:
+                side = "long"
+                score = (low_vol_threshold - vol_norm) + abs(trend)
+            elif vol_norm > high_vol_threshold and trend < -trend_threshold:
+                side = "short"
+                score = (vol_norm - high_vol_threshold) + abs(trend)
+            else:
+                continue
 
-        return features
+            size = float(self.config.get("base_size", 1.0))
 
-    def _signal(self, f: Dict[str, float], regime: str) -> float:
-        # Regime weights for volatility alignment
-        w = {
-            "BULL": 0.6,
-            "EXPANSION": 0.9,
-            "NEUTRAL": 1.0,
-            "VOLATILE": 1.6,
-            "BEAR": 1.3,
-            "CRISIS": 2.0,
-        }[regime]
+            signals.append(
+                StrategySignal(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    score=score,
+                    confidence=min(1.0, score),
+                    strategy=self.name,
+                    timestamp=context.timestamp,
+                    metadata={
+                        "close": close,
+                        "ma_fast": ma_fast,
+                        "ma_slow": ma_slow,
+                        "volatility_20": vol20,
+                        "vol_norm": vol_norm,
+                        "trend": trend,
+                    },
+                )
+            )
 
-        # Volatility expansion that aligns with regime = strong signal
-        core = f["vol_ratio"] * (1 + f["vol_slope"])
-        entropy_penalty = max(0.1, 1.0 - f["entropy20"])
-
-        return core * w * entropy_penalty
-
-    def run(self, history: Dict[str, Dict], regime: str) -> Dict:
-        features = self._compute_features(history)
-        signal = {s: self._signal(f, regime) for s, f in features.items()}
-
-        pnl_est = float(np.mean(list(signal.values())))
-        vol_est = float(np.std(list(signal.values())))
-
-        return {
-            "features": features,
-            "signal": signal,
-            "pnl_estimate": pnl_est,
-            "vol_estimate": vol_est,
-        }
+        return signals

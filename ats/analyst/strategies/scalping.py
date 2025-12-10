@@ -1,68 +1,57 @@
+# ats/analyst/strategies/scalping.py
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List, Mapping
 
-import numpy as np
+from ..registry import register_strategy
+from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
 
 
-class ScalpingStrategy:
-    """Z-Ultra Scalping (F2 Depth)
-    Uses micro-momentum, volatility compression,
-    and regime-scaled hit-rate modeling.
+@register_strategy
+class ScalpingStrategy(StrategyBase):
+    """
+    Intraday scalping strategy placeholder.
+
+    Expects high-frequency signals from an external microstructure engine via
+    `context.metadata.get("scalping_signals", {})`:
+        {symbol: {"side": "long" | "short", "score": float}}
+
+    In the current daily-bar backtest, this will usually remain silent unless
+    populated by live ingestion.
     """
 
-    def __init__(self):
-        pass
+    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
+        signals: List[StrategySignal] = []
 
-    def _compute_features(self, history: Dict[str, Dict]) -> Dict[str, Dict]:
-        features = {}
+        scalping_map: Mapping[str, Dict[str, object]] = context.metadata.get(
+            "scalping_signals", {}
+        )
+        if not scalping_map:
+            return signals
 
-        for symbol, data in history.items():
-            closes = np.array(data["close"][-30:])
-            highs = np.array(data["high"][-30:])
-            lows = np.array(data["low"][-30:])
+        threshold = float(self.config.get("score_threshold", 0.3))
+        base_size = float(self.config.get("base_size", 0.5))
 
-            vol10 = np.std(closes[-10:])
-            spread = (highs[-1] - lows[-1]) / (closes[-1] + 1e-9)
+        for symbol, info in scalping_map.items():
+            side = str(info.get("side", "flat"))
+            score = float(info.get("score", 0.0))
 
-            # micro momentum = last 3 bars
-            mm = (closes[-1] - closes[-4]) / (vol10 + 1e-9)
+            if side not in ("long", "short"):
+                continue
+            if abs(score) < threshold:
+                continue
 
-            features[symbol] = {
-                "vol10": vol10,
-                "spread": spread,
-                "micro_momentum": mm,
-                "compression": vol10 / (np.std(closes[-20:]) + 1e-9),
-            }
+            signals.append(
+                StrategySignal(
+                    symbol=symbol,
+                    side=side,
+                    size=base_size,
+                    score=abs(score),
+                    confidence=min(1.0, abs(score)),
+                    strategy=self.name,
+                    timestamp=context.timestamp,
+                    metadata=dict(info),
+                )
+            )
 
-        return features
-
-    def _signal(self, f: Dict[str, float], regime: str) -> float:
-        # Scalping is extremely regime sensitive
-        w = {
-            "BULL": 1.0,
-            "EXPANSION": 0.9,
-            "NEUTRAL": 0.6,
-            "VOLATILE": -0.2,  # avoid scalping in chop
-            "BEAR": -0.5,
-            "CRISIS": -1.0,
-        }[regime]
-
-        compression_gate = max(0.0, 1.0 - f["compression"])
-        spread_penalty = max(0.0, 1.0 - f["spread"] * 5)
-
-        return f["micro_momentum"] * w * compression_gate * spread_penalty
-
-    def run(self, history: Dict[str, Dict], regime: str) -> Dict:
-        features = self._compute_features(history)
-        signal = {s: self._signal(f, regime) for s, f in features.items()}
-
-        pnl_est = float(np.mean(list(signal.values())))
-        vol_est = float(np.std(list(signal.values())))
-
-        return {
-            "features": features,
-            "signal": signal,
-            "pnl_estimate": pnl_est,
-            "vol_estimate": vol_est,
-        }
+        return signals

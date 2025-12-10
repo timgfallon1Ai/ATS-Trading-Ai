@@ -1,77 +1,62 @@
+# ats/analyst/strategies/arbitrage.py
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
-import numpy as np
+from ..registry import register_strategy
+from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
 
 
-class ArbitrageStrategy:
-    """Z-Ultra Cross-Sectional Arbitrage (F2 Depth)
+@register_strategy
+class ArbitrageStrategy(StrategyBase):
+    """
+    Simple micro-arbitrage style strategy.
 
-    Identifies temporary mispricings between:
-        - symbol vs sector basket
-        - symbol vs index-relative beta
-        - volatility-normalized deviations
-        - regime-adjusted mean expectations
+    Looks for large deviations between price and VWAP and bets on mean reversion.
+    This is a placeholder for more sophisticated multi-leg or cross-venue arb.
     """
 
-    def __init__(self):
-        pass
+    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
+        signals: List[StrategySignal] = []
 
-    def _compute_features(self, history: Dict[str, Dict]) -> Dict[str, Dict]:
-        features = {}
+        threshold = float(self.config.get("threshold", 0.003))
 
-        # Build index proxy (simple mean of all closes)
-        all_closes = [np.array(v["close"][-60:]) for v in history.values()]
-        index_proxy = np.mean(all_closes, axis=0)
+        for symbol in context.universe:
+            feats: Dict[str, float] = context.features.get(symbol, {})
+            close = float(feats.get("close", 0.0))
+            vwap = float(feats.get("vwap", close or 1.0))
 
-        for symbol, data in history.items():
-            closes = np.array(data["close"][-60:])
-            vol20 = np.std(closes[-20:])
-            vol60 = np.std(closes[-60:])
+            if vwap <= 0.0 or close <= 0.0:
+                continue
 
-            # Beta estimate
-            beta = np.cov(closes[-40:], index_proxy[-40:])[0][1] / (
-                np.var(index_proxy[-40:]) + 1e-9
+            deviation = (close - vwap) / vwap
+
+            if abs(deviation) < threshold:
+                continue
+
+            if deviation > 0.0:
+                side = "short"
+            else:
+                side = "long"
+
+            score = abs(deviation)
+            size = float(self.config.get("base_size", 1.0))
+
+            signals.append(
+                StrategySignal(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    score=score,
+                    confidence=min(1.0, score / threshold),
+                    strategy=self.name,
+                    timestamp=context.timestamp,
+                    metadata={
+                        "close": close,
+                        "vwap": vwap,
+                        "deviation": deviation,
+                    },
+                )
             )
 
-            expected = beta * index_proxy[-1]
-            deviation = (closes[-1] - expected) / (vol20 + 1e-9)
-
-            features[symbol] = {
-                "vol20": vol20,
-                "vol60": vol60,
-                "beta": beta,
-                "expected_price": expected,
-                "deviation": deviation,
-                "arb_strength": deviation / (vol20 + 1e-9),
-            }
-
-        return features
-
-    def _signal(self, f: Dict[str, float], regime: str) -> float:
-        # Arbitrage is strongest in neutral or mean-reverting regimes
-        w = {
-            "BULL": 0.5,
-            "EXPANSION": 0.7,
-            "NEUTRAL": 1.4,
-            "VOLATILE": 1.1,
-            "BEAR": 0.8,
-            "CRISIS": 0.4,
-        }[regime]
-
-        return -f["arb_strength"] * w  # negative deviation → long, positive → short
-
-    def run(self, history: Dict[str, Dict], regime: str) -> Dict:
-        features = self._compute_features(history)
-        signal = {s: self._signal(f, regime) for s, f in features.items()}
-
-        pnl_est = float(np.mean(list(-np.abs(list(signal.values())))))
-        vol_est = float(np.std(list(signal.values())))
-
-        return {
-            "features": features,
-            "signal": signal,
-            "pnl_estimate": pnl_est,
-            "vol_estimate": vol_est,
-        }
+        return signals

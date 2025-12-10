@@ -1,68 +1,65 @@
+# ats/analyst/strategies/swing.py
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
-import numpy as np
+from ..registry import register_strategy
+from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
 
 
-class SwingStrategy:
-    """Z-Ultra Swing Trading (F2)
-    Captures 3–10 day oscillations using:
-    - volatility-normalized wave patterns,
-    - entropy gating,
-    - regime-adaptive amplitude scoring.
+@register_strategy
+class SwingStrategy(StrategyBase):
+    """
+    Swing-trading strategy.
+
+    Looks for pullbacks within a broader trend:
+    - Uptrend: slow MA above price history; buy dips below fast MA.
+    - Downtrend: slow MA below; sell rallies above fast MA.
     """
 
-    def __init__(self):
-        pass
+    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
+        signals: List[StrategySignal] = []
 
-    def _compute_features(self, history: Dict[str, Dict]) -> Dict[str, Dict]:
-        features = {}
+        pullback = float(self.config.get("pullback", 0.01))
+        trend_threshold = float(self.config.get("trend_threshold", 0.005))
 
-        for symbol, data in history.items():
-            closes = np.array(data["close"][-80:])
+        for symbol in context.universe:
+            feats: Dict[str, float] = context.features.get(symbol, {})
+            close = float(feats.get("close", 0.0))
+            ma_fast = float(feats.get("ma_fast", close or 1.0))
+            ma_slow = float(feats.get("ma_slow", close or 1.0))
 
-            # 3-day and 10-day swings
-            swing3 = closes[-1] - closes[-4]
-            swing10 = closes[-1] - closes[-11]
+            if close <= 0.0 or ma_slow <= 0.0:
+                continue
 
-            vol20 = np.std(closes[-20:])
-            entropy10 = float(np.std(np.diff(closes[-10:])))
+            trend = (ma_fast - ma_slow) / ma_slow
 
-            features[symbol] = {
-                "swing3": swing3 / (vol20 + 1e-9),
-                "swing10": swing10 / (vol20 + 1e-9),
-                "vol20": vol20,
-                "entropy10": entropy10,
-                "osc_strength": (swing3 + swing10) / (vol20 + 1e-9),
-            }
+            if trend > trend_threshold and close < ma_fast * (1.0 - pullback):
+                side = "long"
+            elif trend < -trend_threshold and close > ma_fast * (1.0 + pullback):
+                side = "short"
+            else:
+                continue
 
-        return features
+            score = abs(trend)
+            size = float(self.config.get("base_size", 1.0))
 
-    def _signal(self, f: Dict[str, float], regime: str) -> float:
-        # Regime-scaled oscillation amplitude
-        w = {
-            "BULL": 0.8,
-            "EXPANSION": 0.9,
-            "NEUTRAL": 1.2,
-            "VOLATILE": 1.5,
-            "BEAR": 1.1,
-            "CRISIS": 1.4,
-        }[regime]
+            signals.append(
+                StrategySignal(
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    score=score,
+                    confidence=min(1.0, score / trend_threshold),
+                    strategy=self.name,
+                    timestamp=context.timestamp,
+                    metadata={
+                        "close": close,
+                        "ma_fast": ma_fast,
+                        "ma_slow": ma_slow,
+                        "trend": trend,
+                    },
+                )
+            )
 
-        entropy_gate = max(0.0, 1.0 - f["entropy10"])
-        return f["osc_strength"] * w * entropy_gate
-
-    def run(self, history: Dict[str, Dict], regime: str) -> Dict:
-        features = self._compute_features(history)
-        signal = {s: self._signal(f, regime) for s, f in features.items()}
-
-        pnl_est = float(np.mean(list(signal.values())))
-        vol_est = float(np.std(list(signal.values())))
-
-        return {
-            "features": features,
-            "signal": signal,
-            "pnl_estimate": pnl_est,
-            "vol_estimate": vol_est,
-        }
+        return signals
