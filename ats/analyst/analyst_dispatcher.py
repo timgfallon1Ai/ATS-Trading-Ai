@@ -1,53 +1,53 @@
 # ats/analyst/analyst_dispatcher.py
-
 from __future__ import annotations
 
-from typing import Dict
+from typing import List, Mapping, Optional, Sequence
 
+from .analyst_engine import AnalystEngine
 from .feature_engine import FeatureEngine
-from .strategy_manager import StrategyManager
+from .registry import create_strategies
+from .strategy_api import StrategySignal, StrategyConfig
 
 
 class AnalystDispatcher:
-    """Unified interface exposing:
-      - Feature extraction
-      - Strategy signal generation
+    """
+    High-level façade for the analyst layer.
 
-    Fully compatible with BT-2A dispatcher requirements.
+    In backtest mode, this can be constructed with a simple strategy config.
+    In live mode, it can later be wired into the orchestrator.
     """
 
-    def __init__(self):
-        self.features = FeatureEngine()
-        self.strategies = StrategyManager()
+    def __init__(
+        self,
+        strategy_config: Mapping[str, StrategyConfig],
+        feature_engine: Optional[FeatureEngine] = None,
+    ) -> None:
+        self._strategies = create_strategies(strategy_config)
+        self._engine = AnalystEngine(self._strategies, feature_engine=feature_engine)
 
-    # ----------------------------------------------------
-    # Features
-    # ----------------------------------------------------
-    def run_features(
-        self, ts: int, symbol_bars: Dict[str, Dict[str, float]]
-    ) -> Dict[str, Dict[str, float]]:
-        """Returns:
-        { symbol: { feature_name: value } }
+    @property
+    def engine(self) -> AnalystEngine:
+        return self._engine
 
+    def on_startup(self) -> None:
+        self._engine.on_startup()
+
+    def on_shutdown(self) -> None:
+        self._engine.on_shutdown()
+
+    def evaluate_bar(
+        self,
+        timestamp: str,
+        universe: Sequence[str],
+        prices: Mapping[str, float],
+        risk_state: Optional[Mapping[str, object]] = None,
+    ) -> List[StrategySignal]:
         """
-        out = {}
-        for sym, bar in symbol_bars.items():
-            out[sym] = self.features.extract_features(ts, sym, bar)
-        return out
-
-    # ----------------------------------------------------
-    # Signals
-    # ----------------------------------------------------
-    def run_signals(
-        self, ts: int, features: Dict[str, Dict[str, float]]
-    ) -> Dict[str, float]:
-        """Returns:
-            { symbol: signal_strength }
-
-        signal_strength is expected to be between -1.0 and +1.0.
-
+        Convenience wrapper around AnalystEngine.evaluate_bar.
         """
-        out: Dict[str, float] = {}
-        for sym, feats in features.items():
-            out[sym] = self.strategies.generate_signal(ts, sym, feats)
-        return out
+        return self._engine.evaluate_bar(
+            timestamp=timestamp,
+            universe=universe,
+            prices=prices,
+            risk_state=risk_state,
+        )
