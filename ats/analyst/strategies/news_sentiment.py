@@ -1,75 +1,41 @@
 from __future__ import annotations
 
-from typing import Dict
+import pandas as pd
 
-import numpy as np
+from ats.analyst.strategy_api import FeatureRow, StrategySignal
+from ats.analyst.strategy_base import StrategyBase
 
 
-class NewsSentimentStrategy:
-    """Z-Ultra Sentiment Model (F2 Depth)
+class NewsSentimentStrategy(StrategyBase):
+    """Bridge to the news-sentiment subsystem.
 
-    Placeholder internal sentiment engine until live news streams
-    (Benzinga / Polygon / Twitter / IBKR) are connected.
-
-    Computes:
-        - price reaction to prior volatility (proxy for sentiment)
-        - overnight gap sentiment
-        - momentum shock index
-        - volatility-adjusted drift
+    For now: neutral unless a `news_sentiment` feature is provided.
     """
 
-    def __init__(self):
-        pass
+    def generate_signal(
+        self,
+        symbol: str,
+        features: FeatureRow,
+        history: pd.DataFrame,
+    ) -> StrategySignal:
+        sentiment = float(features.get("news_sentiment", 0.0))
 
-    def _compute_features(self, history: Dict[str, Dict]) -> Dict[str, Dict]:
-        feats = {}
+        if sentiment == 0.0:
+            return StrategySignal(
+                symbol=symbol,
+                strategy_name=self.name,
+                score=0.0,
+                confidence=0.0,
+                metadata={"reason": "no sentiment signal available"},
+            )
 
-        for symbol, data in history.items():
-            closes = np.array(data["close"][-60:])
-            opens = np.array(data["open"][-60:])
+        score = max(-1.0, min(1.0, sentiment))
+        confidence = min(1.0, abs(sentiment))
 
-            ret = closes[-1] - closes[-2]
-            vol20 = np.std(closes[-20:])
-            overnight_gap = (opens[-1] - closes[-2]) / (closes[-2] + 1e-9)
-
-            shock_index = ret / (vol20 + 1e-9)
-
-            drift = np.mean(np.diff(closes[-10:]))
-
-            feats[symbol] = {
-                "overnight_gap": overnight_gap,
-                "shock_index": shock_index,
-                "drift": drift,
-                "sent_strength": (
-                    overnight_gap * 0.4 + shock_index * 0.4 + drift * 0.2
-                ),
-            }
-
-        return feats
-
-    def _signal(self, f: Dict[str, float], regime: str) -> float:
-        # Sentiment is more powerful in trend regimes
-        w = {
-            "BULL": 1.5,
-            "EXPANSION": 1.2,
-            "NEUTRAL": 0.9,
-            "VOLATILE": 0.7,
-            "BEAR": -0.4,
-            "CRISIS": -0.8,
-        }[regime]
-
-        return f["sent_strength"] * w
-
-    def run(self, history: Dict[str, Dict], regime: str) -> Dict:
-        features = self._compute_features(history)
-        signal = {s: self._signal(f, regime) for s, f in features.items()}
-
-        pnl_est = float(np.mean(list(signal.values())))
-        vol_est = float(np.std(list(signal.values())))
-
-        return {
-            "features": features,
-            "signal": signal,
-            "pnl_estimate": pnl_est,
-            "vol_estimate": vol_est,
-        }
+        return StrategySignal(
+            symbol=symbol,
+            strategy_name=self.name,
+            score=score,
+            confidence=confidence,
+            metadata={"sentiment": sentiment},
+        )

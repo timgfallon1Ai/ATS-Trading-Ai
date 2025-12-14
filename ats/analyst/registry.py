@@ -1,76 +1,53 @@
-"""Global Strategy Registry
-
-This is the central registry for all strategies in Option A architecture.
-
-Strategies are registered automatically via the @register_strategy("name")
-decorator inside strategy_base.py.
-
-The AnalystEngine will instantiate strategies from this registry at runtime.
-
-This file MUST remain extremely stable.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Type
+from typing import Dict, List, Sequence, Type
 
-from .strategy_base import Strategy
-
-
-# =====================================================================
-# Registry Storage Class
-# =====================================================================
-@dataclass
-class StrategyRegistry:
-    """Holds a mapping of:
-        name (str) → class (subclass of Strategy)
-
-    This class performs:
-        - registration validation
-        - duplicate checking
-        - safe retrieval for AnalystEngine
-    """
-
-    registry: Dict[str, Type[Strategy]]
-
-    # ---------------------------------------------------------------
-    def __init__(self) -> None:
-        self.registry = {}
-
-    # ---------------------------------------------------------------
-    def register(self, name: str, cls: Type[Strategy]) -> None:
-        """Registers a strategy class under a given name."""
-        if name in self.registry:
-            raise RuntimeError(f"Strategy '{name}' already registered.")
-
-        if not issubclass(cls, Strategy):
-            raise TypeError(f"Class {cls.__name__} must extend Strategy.")
-
-        self.registry[name] = cls
-
-    # ---------------------------------------------------------------
-    def create(self, name: str) -> Strategy:
-        """Instantiates a strategy by name.
-
-        Example:
-            strat = registry.create("mean_reversion")
-
-        """
-        if name not in self.registry:
-            raise KeyError(f"Strategy '{name}' not found.")
-
-        cls = self.registry[name]
-        return cls(name)
-
-    # ---------------------------------------------------------------
-    def list_strategies(self) -> Dict[str, Type[Strategy]]:
-        """Returns the internal registry for metadata/UI."""
-        return dict(self.registry)
+from ats.analyst.strategy_base import StrategyBase
+from ats.analyst.strategies import (
+    ArbitrageStrategy,
+    BreakoutStrategy,
+    EarningsStrategy,
+    MacroTrendStrategy,
+    MeanReversionStrategy,
+    MomentumStrategy,
+    MultiFactorStrategy,
+    NewsSentimentStrategy,
+    PatternRecognitionStrategy,
+    ScalpingStrategy,
+    SwingStrategy,
+    VolatilityRegimeStrategy,
+    ValueStrategy,
+)
 
 
-# =====================================================================
-# Global Singleton
-# =====================================================================
+STRATEGY_REGISTRY: Dict[str, Type[StrategyBase]] = {
+    "arbitrage": ArbitrageStrategy,
+    "breakout": BreakoutStrategy,
+    "earnings": EarningsStrategy,
+    "macro_trend": MacroTrendStrategy,
+    "mean_reversion": MeanReversionStrategy,
+    "momentum": MomentumStrategy,
+    "multi_factor": MultiFactorStrategy,
+    "news_sentiment": NewsSentimentStrategy,
+    "pattern_recognition": PatternRecognitionStrategy,
+    "scalping": ScalpingStrategy,
+    "swing": SwingStrategy,
+    "volatility_regime": VolatilityRegimeStrategy,
+    "value": ValueStrategy,
+}
 
-strategy_registry = StrategyRegistry()
+
+def available_strategies() -> List[str]:
+    return sorted(STRATEGY_REGISTRY.keys())
+
+
+def make_strategies(names: Sequence[str] = None) -> List[StrategyBase]:
+    if names is None:
+        names = available_strategies()
+    result: List[StrategyBase] = []
+    for name in names:
+        cls = STRATEGY_REGISTRY.get(name)
+        if cls is None:
+            raise KeyError(f"Unknown strategy name: {name}")
+        result.append(cls())
+    return result

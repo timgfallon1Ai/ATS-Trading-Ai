@@ -1,56 +1,53 @@
-# ats/analyst/strategies/pattern_recognition.py
 from __future__ import annotations
 
-from typing import Dict, List, Mapping
+import pandas as pd
 
-from ..registry import register_strategy
-from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
+from ats.analyst.strategy_api import FeatureRow, StrategySignal
+from ats.analyst.strategy_base import StrategyBase
 
 
-@register_strategy
 class PatternRecognitionStrategy(StrategyBase):
-    """
-    Pattern-recognition strategy.
+    """Very simple 3-bar candlestick pattern detector."""
 
-    Expects `context.metadata.get("pattern_signals", {})` to be a mapping:
-        {symbol: {"side": "long" | "short", "score": float}}
+    lookback: int = 3
 
-    This is a hook for more advanced pattern engines (candlesticks, microstructure,
-    ML pattern classifiers, etc.).
-    """
+    def generate_signal(
+        self,
+        symbol: str,
+        features: FeatureRow,
+        history: pd.DataFrame,
+    ) -> StrategySignal:
+        if history.shape[0] < self.lookback:
+            return StrategySignal(symbol, self.name, 0.0, 0.0)
 
-    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
-        signals: List[StrategySignal] = []
+        window = history.iloc[-self.lookback :]
 
-        pattern_map: Mapping[str, Dict[str, object]] = context.metadata.get(
-            "pattern_signals", {}
+        if not {"open", "close"}.issubset(window.columns):
+            return StrategySignal(symbol, self.name, 0.0, 0.0)
+
+        closes = window["close"].astype(float)
+        opens = window["open"].astype(float)
+        up = closes > opens
+        down = closes < opens
+
+        score = 0.0
+        confidence = 0.0
+
+        if up.all():
+            score = 0.7
+            confidence = 0.6
+        elif down.all():
+            score = -0.7
+            confidence = 0.6
+
+        pattern_name = (
+            "up_three" if score > 0 else "down_three" if score < 0 else "none"
         )
-        if not pattern_map:
-            return signals
 
-        threshold = float(self.config.get("score_threshold", 0.2))
-        base_size = float(self.config.get("base_size", 1.0))
-
-        for symbol, info in pattern_map.items():
-            side = str(info.get("side", "flat"))
-            score = float(info.get("score", 0.0))
-
-            if side not in ("long", "short"):
-                continue
-            if abs(score) < threshold:
-                continue
-
-            signals.append(
-                StrategySignal(
-                    symbol=symbol,
-                    side=side,
-                    size=base_size,
-                    score=abs(score),
-                    confidence=min(1.0, abs(score)),
-                    strategy=self.name,
-                    timestamp=context.timestamp,
-                    metadata=dict(info),
-                )
-            )
-
-        return signals
+        return StrategySignal(
+            symbol=symbol,
+            strategy_name=self.name,
+            score=score,
+            confidence=confidence,
+            metadata={"pattern": pattern_name},
+        )

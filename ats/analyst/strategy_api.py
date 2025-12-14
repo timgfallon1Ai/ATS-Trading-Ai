@@ -1,56 +1,44 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Dict
 
-
-@dataclass
-class FeatureVector:
-    """A normalized, validated feature set produced by FeatureEngine.
-    Keys: str feature names
-    Values: float values
-    """
-
-    values: Dict[str, float]
+FeatureRow = Dict[str, float]
 
 
 @dataclass
 class StrategySignal:
-    """Unified output format for all strategy modules.
-    strategy: name of the strategy, e.g. "momentum"
-    symbol:   trading symbol
-    score:    raw score or probability
-    metadata: debug / intermediate data
+    """Unified output from a single strategy.
+
+    Attributes
+    ----------
+    symbol:
+        Ticker the signal applies to.
+    strategy_name:
+        Human-readable strategy identifier.
+    score:
+        Directional conviction in [-1, 1].
+        -1 = strong short, 0 = neutral, +1 = strong long.
+    confidence:
+        Weight in [0, 1] used when aggregating across strategies.
+    metadata:
+        Optional strategy-specific diagnostics.
     """
 
-    strategy: str
     symbol: str
+    strategy_name: str
     score: float
-    metadata: Dict[str, Any]
+    confidence: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
-
-@dataclass
-class StrategyConfig:
-    """Formal configuration for each strategy, allowing
-    different thresholds / lookbacks / modes.
-    """
-
-    name: str
-    params: Dict[str, Any]
-
-
-class Strategy:
-    """Base interface for all ATS strategies.
-
-    Each strategy MUST implement:
-        - generate()
-    """
-
-    def __init__(self, config: StrategyConfig):
-        self.config = config
-
-    def generate(self, symbol: str, features: FeatureVector) -> List[StrategySignal]:
-        """Produce one or more signals for a symbol.
-        Returned values MUST be StrategySignal instances.
-        """
-        raise NotImplementedError
+    def normalized(self) -> "StrategySignal":
+        """Return a copy with score / confidence clipped to valid ranges."""
+        score = max(-1.0, min(1.0, float(self.score)))
+        confidence = max(0.0, min(1.0, float(self.confidence)))
+        return StrategySignal(
+            symbol=self.symbol,
+            strategy_name=self.strategy_name,
+            score=score,
+            confidence=confidence,
+            metadata=dict(self.metadata),
+        )

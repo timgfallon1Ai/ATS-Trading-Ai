@@ -7,10 +7,8 @@ from ats.analyst.strategy_api import FeatureRow, StrategySignal
 from ats.analyst.strategy_base import StrategyBase
 
 
-class ScalpingStrategy(StrategyBase):
-    """Short-horizon mean reversion on 1-day returns."""
-
-    threshold: float = 0.02  # 2%
+class ValueStrategy(StrategyBase):
+    """Cheap-versus-expensive using the slow moving average as anchor."""
 
     def generate_signal(
         self,
@@ -18,23 +16,20 @@ class ScalpingStrategy(StrategyBase):
         features: FeatureRow,
         history: pd.DataFrame,
     ) -> StrategySignal:
-        r1 = float(features.get("return_1d", 0.0))
+        price = float(features.get("close", 0.0))
+        sma_slow = float(features.get("sma_slow", 0.0))
 
-        if r1 == 0.0:
+        if price <= 0.0 or sma_slow == 0.0:
             return StrategySignal(symbol, self.name, 0.0, 0.0)
 
-        score = 0.0
-        if r1 > self.threshold:
-            score = -float(np.tanh((r1 - self.threshold) * 20.0))
-        elif r1 < -self.threshold:
-            score = float(np.tanh((-self.threshold - r1) * 20.0))
-
-        confidence = min(1.0, abs(r1) * 25.0)
+        discount = (sma_slow - price) / sma_slow
+        score = float(np.tanh(discount * 4.0))
+        confidence = min(1.0, abs(discount) * 6.0)
 
         return StrategySignal(
             symbol=symbol,
             strategy_name=self.name,
             score=score,
             confidence=confidence,
-            metadata={"return_1d": r1},
+            metadata={"discount": discount, "price": price, "anchor": sma_slow},
         )

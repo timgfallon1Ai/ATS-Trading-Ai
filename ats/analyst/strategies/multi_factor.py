@@ -1,76 +1,48 @@
-# ats/analyst/strategies/multi_factor.py
 from __future__ import annotations
 
-from typing import Dict, List
+import numpy as np
+import pandas as pd
 
-from ..registry import register_strategy
-from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
+from ats.analyst.strategy_api import FeatureRow, StrategySignal
+from ats.analyst.strategy_base import StrategyBase
 
 
-@register_strategy
 class MultiFactorStrategy(StrategyBase):
-    """
-    Composite multi-factor strategy.
+    """Blend momentum, value, and volatility into a single score."""
 
-    Combines simple factors:
-    - momentum: fast vs slow MA
-    - volatility: prefer moderate volatility regimes
-    """
+    def generate_signal(
+        self,
+        symbol: str,
+        features: FeatureRow,
+        history: pd.DataFrame,
+    ) -> StrategySignal:
+        price = float(features.get("close", 0.0))
+        sma_fast = float(features.get("sma_fast", 0.0))
+        sma_slow = float(features.get("sma_slow", 0.0))
+        vol = float(features.get("volatility", 0.0))
 
-    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
-        signals: List[StrategySignal] = []
+        if price <= 0.0 or sma_slow == 0.0:
+            return StrategySignal(symbol, self.name, 0.0, 0.0)
 
-        mom_weight = float(self.config.get("momentum_weight", 1.0))
-        vol_weight = float(self.config.get("vol_weight", 0.5))
-        vol_target = float(self.config.get("vol_target", 0.02))
-        score_threshold = float(self.config.get("score_threshold", 0.01))
+        mom = (sma_fast - sma_slow) / sma_slow
+        value = (sma_slow - price) / sma_slow
 
-        for symbol in context.universe:
-            feats: Dict[str, float] = context.features.get(symbol, {})
-            close = float(feats.get("close", 0.0))
-            ma_fast = float(feats.get("ma_fast", close or 1.0))
-            ma_slow = float(feats.get("ma_slow", close or 1.0))
-            vol20 = float(feats.get("volatility_20", 0.0))
+        target_vol = 0.25
+        if vol <= 0.0:
+            risk_adj = 0.0
+        else:
+            risk_adj = -abs(vol - target_vol) / target_vol
 
-            if close <= 0.0 or ma_slow <= 0.0:
-                continue
+        raw_score = 0.5 * mom + 0.4 * value + 0.1 * risk_adj
+        score = float(np.tanh(raw_score * 5.0))
 
-            momentum = (ma_fast - ma_slow) / ma_slow
-            vol_norm = vol20 / max(close, 1e-9)
+        conf_components = [abs(mom), abs(value), max(0.0, -risk_adj)]
+        confidence = min(1.0, sum(conf_components))
 
-            vol_penalty = -abs(vol_norm - vol_target)
-
-            composite = mom_weight * momentum + vol_weight * vol_penalty
-
-            if composite > score_threshold:
-                side = "long"
-            elif composite < -score_threshold:
-                side = "short"
-            else:
-                continue
-
-            score = abs(composite)
-            size = float(self.config.get("base_size", 1.0))
-
-            signals.append(
-                StrategySignal(
-                    symbol=symbol,
-                    side=side,
-                    size=size,
-                    score=score,
-                    confidence=min(1.0, score / score_threshold),
-                    strategy=self.name,
-                    timestamp=context.timestamp,
-                    metadata={
-                        "close": close,
-                        "ma_fast": ma_fast,
-                        "ma_slow": ma_slow,
-                        "volatility_20": vol20,
-                        "momentum_factor": momentum,
-                        "volatility_factor": vol_penalty,
-                        "composite": composite,
-                    },
-                )
-            )
-
-        return signals
+        return StrategySignal(
+            symbol=symbol,
+            strategy_name=self.name,
+            score=score,
+            confidence=confidence,
+            metadata={"mom": mom, "value": value, "risk_adj": risk_adj},
+        )

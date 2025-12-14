@@ -1,107 +1,86 @@
-"""Feature Schema — The strongly-typed interface between
-the UBF ingestion layer, AnalystEngine, and all strategies.
-
-This file defines:
-- The Feature type (TypedDict)
-- Allowed fields & their types
-- Optional / required inputs
-- The normalized format all strategies must consume
-
-This ensures:
-✔ Zero drift across strategies
-✔ No undefined TypedDict keys
-✔ Predictable structure for AnalystEngine
-✔ Full Pylance/type checker satisfaction
-"""
-
+# ats/analyst/feature_schema.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, TypedDict
-
-# ============================================================
-# Core Feature Schema
-# ============================================================
+from dataclasses import dataclass
+from typing import Dict, List
 
 
-class Feature(TypedDict, total=False):
-    """Each bar/row delivered to AnalystEngine has this structure.
+@dataclass(frozen=True)
+class FeatureSpec:
+    """
+    Declarative definition of a single feature.
 
-    total=False means:
-    - Only required keys MUST appear
-    - Additional optional fields are allowed
+    The meaning of `window` is left to the FeatureEngine implementation.
     """
 
-    # --------------------------------------------------------
-    # REQUIRED FIELDS — every strategy receives these
-    # --------------------------------------------------------
-    symbol: str
-    timestamp: int  # UNIX epoch ms
-    close: float
-    open: float
-    high: float
-    low: float
-    volume: float
-
-    # --------------------------------------------------------
-    # OPTIONAL FIELDS — UBF may include these depending on data source
-    # Strategies can use them if present
-    # --------------------------------------------------------
-    vwap: Optional[float]
-    returns_1m: Optional[float]
-    returns_5m: Optional[float]
-    volatility: Optional[float]
-
-    # Macro signals
-    macro_score: Optional[float]
-
-    # Sentiment signals
-    sentiment_score: Optional[float]
-
-    # Fundamental / news events
-    earnings_flag: Optional[int]
-    earnings_score: Optional[float]
-
-    # Pattern recognition fields
-    pattern_tag: Optional[str]
-
-    # ML-driven factors
-    factor_scores: Optional[Dict[str, float]]
-
-    # Raw vendor-specific extra payload
-    meta: Optional[Dict[str, Any]]
+    name: str
+    description: str = ""
+    window: int = 1
 
 
-# ============================================================
-# FeatureBatch
-# ============================================================
+class FeatureSchema:
+    """
+    Central registry of available features.
 
-
-class FeatureBatch(TypedDict):
-    """A batch of features for a single symbol.
-    Used heavily by AnalystEngine and backtester.
+    This keeps feature naming consistent across strategies and engines.
     """
 
-    symbol: str
-    bars: list[Feature]  # ordered oldest → newest
+    def __init__(self) -> None:
+        self._features: Dict[str, FeatureSpec] = {}
+
+    def register(self, spec: FeatureSpec) -> None:
+        self._features[spec.name] = spec
+
+    def get(self, name: str) -> FeatureSpec:
+        return self._features[name]
+
+    def all(self) -> List[FeatureSpec]:
+        return list(self._features.values())
 
 
-# ============================================================
-# Sanity check helpers for ingestion layer
-# ============================================================
+def default_feature_schema() -> FeatureSchema:
+    """
+    Base feature set for v1 of the ATS.
 
-REQUIRED_FEATURE_KEYS = [
-    "symbol",
-    "timestamp",
-    "close",
-    "open",
-    "high",
-    "low",
-    "volume",
-]
+    This is intentionally modest; we can extend it over time
+    without breaking the contract.
+    """
+    schema = FeatureSchema()
 
+    schema.register(
+        FeatureSpec(
+            name="close",
+            description="Last traded price for the bar.",
+            window=1,
+        )
+    )
+    schema.register(
+        FeatureSpec(
+            name="vwap",
+            description="Volume-weighted average price for the bar.",
+            window=1,
+        )
+    )
+    schema.register(
+        FeatureSpec(
+            name="ma_fast",
+            description="Fast moving average of closing price.",
+            window=20,
+        )
+    )
+    schema.register(
+        FeatureSpec(
+            name="ma_slow",
+            description="Slow moving average of closing price.",
+            window=50,
+        )
+    )
+    schema.register(
+        FeatureSpec(
+            name="volatility_20",
+            description="Rolling volatility over 20 bars.",
+            window=20,
+        )
+    )
 
-def validate_required_fields(f: Feature) -> None:
-    """Raises if any required feature field is missing."""
-    for key in REQUIRED_FEATURE_KEYS:
-        if key not in f:
-            raise KeyError(f"Feature missing required field: {key}")
+    return schema

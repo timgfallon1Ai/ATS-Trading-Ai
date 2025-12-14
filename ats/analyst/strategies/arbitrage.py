@@ -1,62 +1,24 @@
-# ats/analyst/strategies/arbitrage.py
 from __future__ import annotations
 
-from typing import Dict, List
+import pandas as pd
 
-from ..registry import register_strategy
-from ..strategy_api import AnalystContext, StrategyBase, StrategySignal
+from ats.analyst.strategy_api import FeatureRow, StrategySignal
+from ats.analyst.strategy_base import StrategyBase
 
 
-@register_strategy
 class ArbitrageStrategy(StrategyBase):
-    """
-    Simple micro-arbitrage style strategy.
+    """Placeholder for cross-asset / pairs arbitrage."""
 
-    Looks for large deviations between price and VWAP and bets on mean reversion.
-    This is a placeholder for more sophisticated multi-leg or cross-venue arb.
-    """
-
-    def generate_signals(self, context: AnalystContext) -> List[StrategySignal]:
-        signals: List[StrategySignal] = []
-
-        threshold = float(self.config.get("threshold", 0.003))
-
-        for symbol in context.universe:
-            feats: Dict[str, float] = context.features.get(symbol, {})
-            close = float(feats.get("close", 0.0))
-            vwap = float(feats.get("vwap", close or 1.0))
-
-            if vwap <= 0.0 or close <= 0.0:
-                continue
-
-            deviation = (close - vwap) / vwap
-
-            if abs(deviation) < threshold:
-                continue
-
-            if deviation > 0.0:
-                side = "short"
-            else:
-                side = "long"
-
-            score = abs(deviation)
-            size = float(self.config.get("base_size", 1.0))
-
-            signals.append(
-                StrategySignal(
-                    symbol=symbol,
-                    side=side,
-                    size=size,
-                    score=score,
-                    confidence=min(1.0, score / threshold),
-                    strategy=self.name,
-                    timestamp=context.timestamp,
-                    metadata={
-                        "close": close,
-                        "vwap": vwap,
-                        "deviation": deviation,
-                    },
-                )
-            )
-
-        return signals
+    def generate_signal(
+        self,
+        symbol: str,
+        features: FeatureRow,
+        history: pd.DataFrame,
+    ) -> StrategySignal:
+        return StrategySignal(
+            symbol=symbol,
+            strategy_name=self.name,
+            score=0.0,
+            confidence=0.0,
+            metadata={"reason": "arbitrage requires multiple instruments"},
+        )
