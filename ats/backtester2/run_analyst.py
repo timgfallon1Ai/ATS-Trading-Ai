@@ -70,6 +70,11 @@ def run_backtest(symbol: str, days: int, starting_cash: float = 100_000.0) -> No
     trades: List[Dict[str, object]] = []
     allocations: List[Dict[str, object]] = []
 
+    # knobs you can tune
+    min_exposure_change = 0.05  # don’t trade unless target exposure moves by > 5%
+    max_trade_notional_frac = 0.20  # at most 20% of equity per bar
+    long_only = False  # flip to True if you want no net shorts
+
     for idx, row in bars.iterrows():
         history = bars.iloc[: idx + 1]
         price = float(row["close"])
@@ -83,16 +88,41 @@ def run_backtest(symbol: str, days: int, starting_cash: float = 100_000.0) -> No
         score = float(alloc["score"])
         confidence = float(alloc["confidence"])
 
-        # Target exposure in [-1, 1]
+        # Desired exposure in [-1, 1] (or [0, 1] if long_only)
         target_exposure = score * confidence
+        if long_only:
+            target_exposure = max(0.0, target_exposure)
+
         max_notional = state.equity
+        if max_notional <= 0.0:
+            # blew up; stop trading
+            break
 
         desired_notional = target_exposure * max_notional
         desired_position = int(desired_notional / price)
 
+        # Current exposure based on existing position
+        current_notional = state.position * price
+        current_exposure = current_notional / max_notional
+
+        # 1) Only trade if exposure meaningfully changes
+        if abs(target_exposure - current_exposure) < min_exposure_change:
+            continue
+
         delta = desired_position - state.position
         if delta == 0:
             continue
+
+        # 2) Cap trade size per bar by notional fraction
+        max_trade_notional = max_notional * max_trade_notional_frac
+        max_trade_shares = int(max_trade_notional / price)
+        if max_trade_shares <= 0:
+            max_trade_shares = 1
+
+        if delta > max_trade_shares:
+            delta = max_trade_shares
+        elif delta < -max_trade_shares:
+            delta = -max_trade_shares
 
         trade_notional = delta * price
 
@@ -108,6 +138,8 @@ def run_backtest(symbol: str, days: int, starting_cash: float = 100_000.0) -> No
                 "notional": trade_notional,
                 "score": score,
                 "confidence": confidence,
+                "target_exposure": target_exposure,
+                "current_exposure": current_exposure,
             }
         )
 
