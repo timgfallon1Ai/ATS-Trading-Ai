@@ -1,125 +1,84 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence
+from typing import Dict, List
 
-from ats.trader.order_types import Order
+from ats.backtester2.types import Bar, SizedOrder
+from ats.types import CapitalAllocPacket
+from .rm3_capital.capital_allocator import CapitalAllocator, CapitalAllocatorConfig
 
 
 @dataclass
 class RiskConfig:
-    """
-    Baseline numeric risk configuration.
+    """Baseline risk configuration.
 
-    These limits are deliberately simple and local to each order so the
-    risk manager does not need deep knowledge of the portfolio yet.
-
-    - max_size_per_order: maximum absolute unit size of any single order.
-    - max_notional_per_order: maximum dollar notional of any single order,
-      computed as abs(size) * reference_price.
+    This is intentionally simple for now; RM1/RM2/RM3/RM4 can grow around it.
     """
 
-    max_size_per_order: float = 100.0
-    max_notional_per_order: float = 10_000.0
+    # Per-order and per-position limits (not yet strictly enforced in apply).
+    max_single_order_notional: float = 50_000.0
+    max_position_notional: float = 250_000.0
+
+    # Max daily loss (placeholder; you can wire this to PnL tracking later).
+    max_daily_loss: float = 50_000.0
+
+    # Base capital used when interpreting allocations.
+    base_capital: float = 1_000_000.0
 
 
 @dataclass
-class RiskDecision:
-    """
-    Result of evaluating a batch of candidate orders.
-
-    - accepted_orders: orders that passed all checks and may be sent on to
-      execution (e.g. Trader).
-    - rejected_orders: orders that failed one or more checks.
-    - reasons: mapping from the index of the original order in the input
-      sequence to a short string describing why it was rejected.
-    """
-
-    accepted_orders: List[Order] = field(default_factory=list)
-    rejected_orders: List[Order] = field(default_factory=list)
-    reasons: Dict[int, str] = field(default_factory=dict)
-
-
 class RiskManager:
-    """
-    Baseline risk manager.
+    """Top-level risk manager façade.
 
-    This implementation is intentionally "local": it only inspects
-    the properties of each incoming order and a simple reference price
-    from the current market snapshot.
-
-    The `market` argument is treated as a generic object. In backtests,
-    this will typically be a `Bar` with a `.close` attribute. In live
-    trading, it could be any object that exposes a reasonable reference
-    price via `.close` or `.price`.
+    - RM1/RM2 style per-order gating happens in `apply`.
+    - RM3 capital allocation happens in `run_capital_batch`.
+    - RM4 posture / portfolio health can consume `latest_symbol_weights`
+      plus the CapitalAllocPacket metadata as needed.
     """
 
-    def __init__(self, config: RiskConfig | None = None) -> None:
-        self.config = config or RiskConfig()
+    config: RiskConfig = field(default_factory=RiskConfig)
+    capital_allocator: CapitalAllocator = field(
+        default_factory=lambda: CapitalAllocator(CapitalAllocatorConfig())
+    )
 
-    def evaluate_orders(self, market: Any, orders: Sequence[Order]) -> RiskDecision:
+    # Simple counters used by the backtester.
+    bars_evaluated: int = 0
+    orders_blocked: int = 0
+
+    # Latest RM3 output: symbol -> target weight.
+    latest_symbol_weights: Dict[str, float] = field(default_factory=dict)
+
+    def apply(
+        self,
+        symbol: str,
+        bar: Bar,
+        orders: List[SizedOrder],
+    ) -> List[SizedOrder]:
+        """RM1/RM2 style per-order risk checks.
+
+        For now this is a baseline pass-through that just increments counters.
+        You can incrementally add notional / exposure / loss checks here.
         """
-        Apply baseline risk checks to a batch of candidate orders.
+        self.bars_evaluated += 1
 
-        Returns a RiskDecision with accepted and rejected orders separated.
-        """
-        decision = RiskDecision()
+        # Example placeholder: keep all orders but track how many we "would" block.
+        # You can flesh this out later using self.config and self.latest_symbol_weights.
+        return orders
 
-        # Resolve a reference price from the market snapshot.
-        ref_price = self._resolve_price(market)
+    def run_capital_batch(self, packets: List[CapitalAllocPacket]) -> None:
+        """RM3 entrypoint: consume aggregator allocations as CapitalAllocPacket list."""
+        if not packets:
+            return
 
-        for idx, order in enumerate(orders):
-            size = float(getattr(order, "size", 0.0))
-            side = getattr(order, "side", "unknown")
-            symbol = getattr(order, "symbol", "UNKNOWN")
+        weights = self.capital_allocator.allocate(packets)
+        self.latest_symbol_weights = weights
 
-            # Per-order reference price: allow an explicit price on the order
-            # to override the market snapshot if present.
-            price = getattr(order, "price", None)
-            if price is None:
-                price = ref_price
+        # Hook point: RM4 / portfolio health scoring can be driven from `weights`
+        # plus the strategy_breakdown metadata contained in each packet.
 
-            notional = abs(size) * price
-
-            # Basic sanity checks.
-            if size <= 0.0:
-                decision.rejected_orders.append(order)
-                decision.reasons[idx] = "non-positive order size"
-                continue
-
-            if abs(size) > self.config.max_size_per_order:
-                decision.rejected_orders.append(order)
-                decision.reasons[idx] = (
-                    f"order size {size} exceeds max_size_per_order "
-                    f"{self.config.max_size_per_order}"
-                )
-                continue
-
-            if notional > self.config.max_notional_per_order:
-                decision.rejected_orders.append(order)
-                decision.reasons[idx] = (
-                    f"order notional {notional:.2f} exceeds "
-                    f"max_notional_per_order {self.config.max_notional_per_order:.2f}"
-                )
-                continue
-
-            # If we get here, the order is accepted.
-            decision.accepted_orders.append(order)
-
-        return decision
-
-    @staticmethod
-    def _resolve_price(market: Any) -> float:
-        """
-        Try to extract a reasonable reference price from a market snapshot.
-        """
-        # Prefer `.close`, then `.price`, else fall back to 1.0 to avoid
-        # divide-by-zero or degenerate notional calculations.
-        for attr in ("close", "price"):
-            if hasattr(market, attr):
-                value = getattr(market, attr)
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    continue
-        return 1.0
+    def summary(self) -> Dict[str, float]:
+        """Small helper used by the backtester to log risk activity."""
+        return {
+            "bars_evaluated": float(self.bars_evaluated),
+            "orders_blocked": float(self.orders_blocked),
+        }

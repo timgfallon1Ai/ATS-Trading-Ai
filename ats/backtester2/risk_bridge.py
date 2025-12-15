@@ -1,28 +1,25 @@
-# ats/backtester2/risk_bridge.py
-
 from __future__ import annotations
 
-from typing import List
+from typing import Any, Dict
 
-from ats.backtester2.position_intent import PositionIntent
 from ats.risk_manager.risk_manager import RiskManager
+from ats.risk_manager.rm_bridge import batch_to_capital_packets
 
 
-class RiskBridge:
-    """Converts PositionIntent -> PositionIntent after risk approval.
+def feed_allocations_to_risk(
+    batch: Dict[str, Any],
+    risk_manager: RiskManager,
+    base_capital: float,
+) -> None:
+    """Bridge Aggregator.prepare_batch(...) output into the RiskManager.
 
-    This file is intentionally thin because the RM stack is complex and modular.
+    - `batch` is the full dict returned by Aggregator.prepare_batch(...).
+      It must contain an `allocations` key with AggregatedAllocation entries.
+    - We convert that into CapitalAllocPacket objects via rm_bridge.
+    - Then we call RiskManager.run_capital_batch(...) so RM3/RM4 see them.
     """
+    packets = batch_to_capital_packets(batch=batch, base_capital=base_capital)
+    if not packets:
+        return
 
-    def __init__(self, rm: RiskManager):
-        self.rm = rm
-
-    def review(self, intents: List[PositionIntent]) -> List[PositionIntent]:
-        """Pass intents into RM for evaluation.
-
-        RM returns a filtered / adjusted list.
-        """
-        if not intents:
-            return []
-
-        return self.rm.apply(intents)
+    risk_manager.run_capital_batch(packets)

@@ -1,108 +1,72 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Dict, List
 
-from ats.types import AggregatedAllocation, CapitalAllocPacket
-
-from .concentration_limits import ConcentrationLimits
-from .exposure_rules import ExposureRules
+from ats.types import CapitalAllocPacket
 
 
+@dataclass
+class CapitalAllocatorConfig:
+    """Config for RM3 capital allocation rules."""
+
+    # Maximum gross leverage (sum of absolute symbol weights)
+    max_gross_leverage: float = 2.0
+
+    # Maximum weight per symbol (e.g. 0.25 => <=25% of capital in any one symbol)
+    max_symbol_weight: float = 0.25
+
+
+@dataclass
 class CapitalAllocator:
-    """RM-3 Capital Allocation Engine.
-    Converts RM-2 predictive risk + Aggregator signals into
-    capital-scaled dollar allocations per symbol.
+    """RM3: translate capital packets into symbol weights / exposures.
 
-    Output: CapitalAllocPacket
+    Input: a list of CapitalAllocPacket entries (symbol, capital, score, etc.)
+    Output: a dict symbol -> weight, normalized and constrained by config.
     """
 
-    def __init__(
-        self,
-        exposure: ExposureRules,
-        concentration: ConcentrationLimits,
-        base_capital: float = 1000.0,
-    ):
-        self.exposure = exposure
-        self.concentration = concentration
-        self.base_capital = base_capital
+    config: CapitalAllocatorConfig = field(default_factory=CapitalAllocatorConfig)
 
-    # ---------------------------------------------------------
-    # Compute raw dollar targets
-    # ---------------------------------------------------------
-    def _compute_raw_targets(
-        self,
-        aggs: Dict[str, AggregatedAllocation],
-        predictive: Dict[str, Dict[str, Any]],
-    ) -> Dict[str, float]:
+    def allocate(self, packets: List[CapitalAllocPacket]) -> Dict[str, float]:
+        """Turn CapitalAllocPacket list into normalized symbol weights.
 
-        out: Dict[str, float] = {}
+        Returns a mapping symbol -> weight in [0, 1] whose sum is capped by
+        max_gross_leverage and individual weights are capped by max_symbol_weight.
+        """
+        if not packets:
+            return {}
 
-        for symbol, a in aggs.items():
-            score = predictive.get(symbol, {}).get("model_score", 0.0)
-            risk = predictive.get(symbol, {}).get("risk_score", 0.5)
+        # 1) Aggregate capital per symbol
+        symbol_capital: Dict[str, float] = {}
+        for pkt in packets:
+            sym = pkt["symbol"]
+            cap = float(pkt["capital"])
+            symbol_capital[sym] = symbol_capital.get(sym, 0.0) + cap
 
-            direction = 1 if score >= 0 else -1
+        total_capital = sum(symbol_capital.values())
+        if total_capital <= 0.0:
+            return {}
 
-            # Confidence-weighted target
-            target = a["confidence"] * abs(score) * (1 - risk)
-
-            out[symbol] = direction * target * self.base_capital
-
-        return out
-
-    # ---------------------------------------------------------
-    # Main allocation pipeline
-    # ---------------------------------------------------------
-    def allocate(
-        self,
-        aggs: Dict[str, AggregatedAllocation],
-        predictive: Dict[str, Dict[str, Any]],
-        total_capital: float,
-    ) -> Dict[str, CapitalAllocPacket]:
-
-        # 1) Build raw targets
-        raw = self._compute_raw_targets(aggs, predictive)
-
-        # 2) Symbol exposure limits
-        symbol_limited = {
-            sym: self.exposure.apply_symbol_limit(val, total_capital)
-            for sym, val in raw.items()
+        # 2) Convert to preliminary weights
+        weights: Dict[str, float] = {
+            sym: cap / total_capital for sym, cap in symbol_capital.items()
         }
 
-        # 3) Gross exposure limit (portfolio-level)
-        gross_limited = self.exposure.apply_gross_limit(symbol_limited, total_capital)
+        # 3) Enforce per-symbol max cap
+        max_w = self.config.max_symbol_weight
+        if max_w > 0.0:
+            for sym in list(weights.keys()):
+                if weights[sym] > max_w:
+                    weights[sym] = max_w
 
-        # 4) Concentration limits (symbol)
-        symbol_conc = self.concentration.apply_symbol_concentration(
-            gross_limited, total_capital
+        # 4) Renormalize to respect max gross leverage
+        gross = sum(weights.values())
+        target_gross = (
+            min(self.config.max_gross_leverage, gross) if gross > 0.0 else 0.0
         )
+        if gross > 0.0 and target_gross != gross:
+            scale = target_gross / gross
+            for sym in list(weights.keys()):
+                weights[sym] *= scale
 
-        # 5) Strategy concentration limits
-        # Pull strategy_breakdown from aggs
-        strategy_totals: Dict[str, float] = {}
-        for sym, a in aggs.items():
-            for strat, weight in a["strategy_breakdown"].items():
-                strategy_totals[strat] = strategy_totals.get(
-                    strat, 0
-                ) + weight * symbol_conc.get(sym, 0)
-
-        final_alloc = self.concentration.apply_strategy_concentration(
-            symbol_conc, strategy_totals, total_capital
-        )
-
-        # 6) Build output packets
-        out: Dict[str, CapitalAllocPacket] = {}
-
-        for symbol, dollars in final_alloc.items():
-            packet: CapitalAllocPacket = {
-                "symbol": symbol,
-                "target_dollars": float(dollars),
-                "predicted_risk": predictive.get(symbol, {}).get(
-                    "predicted_risk", 0.02
-                ),
-                "risk_score": predictive.get(symbol, {}).get("risk_score", 0.5),
-                "regime": predictive.get(symbol, {}).get("regime", "neutral"),
-            }
-            out[symbol] = packet
-
-        return out
+        return weights
