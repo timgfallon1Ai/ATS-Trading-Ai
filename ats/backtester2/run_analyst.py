@@ -12,6 +12,7 @@ import pandas as pd
 from ats.aggregator.aggregator import Aggregator
 from ats.analyst.analyst_engine import AnalystEngine
 from ats.analyst.registry import make_strategies
+from ats.risk_manager.rm_bridge import batch_to_capital_packets
 
 
 @dataclass
@@ -28,19 +29,13 @@ class BacktestResult:
 
 
 def _generate_synthetic_history(symbol: str, days: int, seed: int) -> pd.DataFrame:
-    """Generate a simple synthetic OHLCV history for local analyst testing.
-
-    This deliberately stays very simple – the goal is just to exercise the
-    AnalystEngine / Aggregator stack end-to-end without depending on live data.
-    """
+    """Generate a simple synthetic OHLCV history for local analyst testing."""
     rng = np.random.default_rng(seed)
     dates = pd.date_range(end=pd.Timestamp.utcnow().normalize(), periods=days, freq="D")
 
-    # Random walk around a base price.
     prices = 100.0 + rng.normal(scale=1.0, size=days).cumsum()
     prices = np.maximum(prices, 1.0)
 
-    # Derive high/low around close and random volumes.
     close = prices
     open_ = close * (1.0 + rng.normal(0.0, 0.002, size=days))
     high = np.maximum(open_, close) * (1.0 + np.abs(rng.normal(0.0, 0.002, size=days)))
@@ -68,7 +63,6 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
 
     allocations: List[Dict[str, Any]] = []
 
-    # Simple 1‑unit trading simulation driven by aggregated analyst signals.
     starting_equity = 100_000.0
     cash = starting_equity
     position = 0
@@ -76,21 +70,18 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
     last_price = float(history["close"].iloc[0])
 
     for idx, row in history.iterrows():
-        # AnalystEngine expects the full history up to this point so it can compute features.
         window = history.iloc[: idx + 1].copy()
         timestamp = row["timestamp"]
 
         allocation = engine.evaluate(symbol=symbol, history=window, timestamp=timestamp)
         allocations.append(allocation)
 
-        # Turn the allocation into a discrete signal for trading.
         combined = aggregator.combine_allocation(allocation)
         direction = combined["direction"]
         price = float(row["close"])
 
         if direction == "long":
             if position <= 0:
-                # Close any short and go long 1 unit.
                 if position < 0:
                     cash += -position * price
                     trades += 1
@@ -105,14 +96,12 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
                 cash += price
                 position = -1
                 trades += 1
-        # "flat" leaves the current position unchanged.
 
         last_price = price
 
     equity = cash + position * last_price
     realized_pnl = equity - starting_equity
 
-    # Build batch structures for logging / RM bridge.
     batch = aggregator.prepare_batch(allocations)
     combined_signals = batch["combined_signals"]
     normalized_allocs = batch["allocations"]
@@ -123,8 +112,8 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
         "flat": sum(1 for s in combined_signals if s.get("direction") == "flat"),
     }
 
-    # Write full analyst / allocation log for downstream analysis and RM development.
-    log_dir = Path("logs")
+    # --- Logging: full CombinedSignal + allocation per bar ---
+    log_dir = Path("analyst_logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"analyst_backtest_{symbol}.jsonl"
 
@@ -134,9 +123,23 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
                 "symbol": symbol,
                 "timestamp": sig.get("timestamp"),
                 "signal": sig,
-                "allocation": alloc,  # RM‑ready: score, confidence, strategy_breakdown, weight, target_qty, ...
+                "allocation": alloc,
             }
             f.write(json.dumps(record) + "\n")
+
+    # --- RM bridge: turn aggregated allocations into CapitalAllocPacket set ---
+    rm_packets = batch_to_capital_packets(batch, base_capital=starting_equity)
+    rm_log_path = log_dir / f"analyst_backtest_{symbol}_rm.jsonl"
+    with rm_log_path.open("w", encoding="utf-8") as f_rm:
+        for pkt in rm_packets:
+            f_rm.write(json.dumps(pkt) + "\n")
+
+    print(f"Analyst backtest log written to {log_path}")
+    print(f"RM bridge packets written to {rm_log_path}")
+    if rm_packets:
+        print("RM bridge preview (first 3 packets):")
+        for pkt in rm_packets[:3]:
+            print("  ", pkt)
 
     result = BacktestResult(
         symbol=symbol,
@@ -164,7 +167,6 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
         },
     )
     print("Signal breakdown:", result.signal_breakdown)
-    print(f"Analyst backtest log written to {log_path}")
 
     return result
 
