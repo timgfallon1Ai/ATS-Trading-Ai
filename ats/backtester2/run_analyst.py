@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
@@ -29,7 +31,7 @@ def _generate_synthetic_history(symbol: str, days: int, seed: int) -> pd.DataFra
     """Generate a simple synthetic OHLCV history for local analyst testing.
 
     This deliberately stays very simple – the goal is just to exercise the
-    AnalystEngine / Aggregator stack end‑to‑end without depending on live data.
+    AnalystEngine / Aggregator stack end-to-end without depending on live data.
     """
     rng = np.random.default_rng(seed)
     dates = pd.date_range(end=pd.Timestamp.utcnow().normalize(), periods=days, freq="D")
@@ -103,7 +105,7 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
                 cash += price
                 position = -1
                 trades += 1
-        # "flat" leaves the current position unchanged; we keep this intentionally simple.
+        # "flat" leaves the current position unchanged.
 
         last_price = price
 
@@ -113,12 +115,28 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
     # Build batch structures for logging / RM bridge.
     batch = aggregator.prepare_batch(allocations)
     combined_signals = batch["combined_signals"]
+    normalized_allocs = batch["allocations"]
 
     signal_breakdown = {
         "long": sum(1 for s in combined_signals if s.get("direction") == "long"),
         "short": sum(1 for s in combined_signals if s.get("direction") == "short"),
         "flat": sum(1 for s in combined_signals if s.get("direction") == "flat"),
     }
+
+    # Write full analyst / allocation log for downstream analysis and RM development.
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"analyst_backtest_{symbol}.jsonl"
+
+    with log_path.open("w", encoding="utf-8") as f:
+        for sig, alloc in zip(combined_signals, normalized_allocs):
+            record = {
+                "symbol": symbol,
+                "timestamp": sig.get("timestamp"),
+                "signal": sig,
+                "allocation": alloc,  # RM‑ready: score, confidence, strategy_breakdown, weight, target_qty, ...
+            }
+            f.write(json.dumps(record) + "\n")
 
     result = BacktestResult(
         symbol=symbol,
@@ -146,6 +164,7 @@ def run_backtest(symbol: str, days: int, seed: int = 42) -> BacktestResult:
         },
     )
     print("Signal breakdown:", result.signal_breakdown)
+    print(f"Analyst backtest log written to {log_path}")
 
     return result
 
