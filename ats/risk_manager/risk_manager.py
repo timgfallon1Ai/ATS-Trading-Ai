@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List
+from typing import Any, Dict
+
+RiskDecision = Dict[str, Any]
+
 
 from ats.backtester2.types import Bar, SizedOrder
 from ats.types import CapitalAllocPacket
