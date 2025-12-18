@@ -1,22 +1,39 @@
-/.venv
-venv/
+# Python
 __pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.pyc
-dist/
-build/
-*.egg-info/
+.coverage
+htmlcov/
 
-# Local environment file with secrets (do not commit)
-.env
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
 
-# Generated diagnostics and reports
-pyright_report.json
-logs/diagnostics/*
-repo_untracked.txt
-ats/config/keys.yaml
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS / Finder
+.DS_Store
+
+# Logs / artifacts
 logs/
-logs/
+analyst_logs/
+*.log
+*.jsonl
+
+# Local secrets / keys
 keys.yaml
+.env
+.env.*

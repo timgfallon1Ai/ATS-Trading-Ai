@@ -1,22 +1,33 @@
 """
-Shared type contracts for the ATS.
+ATS — Shared Data Model
+-----------------------
 
-These types are used to connect:
-- Analyst / Aggregator output
-- RM-2 predictive models
-- RM-3 capital allocation
-- RM-4 posture / execution filters
-- Backtester and live trader orchestration
+This module defines the shared type contracts used across the ATS.
+
+It is intentionally lightweight and contains **no business logic**. All subsystems
+import from here to maintain cross-module consistency, including:
+
+- Analyst / Aggregator outputs
+- RM-2 predictive packets
+- RM-3 capital allocation packets
+- RM-4+ posture / execution / portfolio / governance packets
+- RM master / orchestrator envelopes (RiskPacket, RiskBatchOutput)
+
+Design notes:
+- We use TypedDict for runtime-serializable packet contracts.
+- Many packets are declared with total=False to allow incremental enrichment
+  without breaking older components.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, TypedDict
+
 from typing_extensions import NotRequired
 
 
 # -----------------------------------------------------------------------------
-# 1. Feature-level contracts (Analyst / Aggregator)
+# 1) Feature-level contracts (Analyst / Aggregator)
 # -----------------------------------------------------------------------------
 
 
@@ -24,8 +35,8 @@ class FeatureVector(TypedDict):
     """
     A single feature snapshot for a symbol at a given timestamp.
 
-    This is the canonical structure passed between the analyst layer
-    and any downstream consumers that operate at the "features" level.
+    This is a convenience wrapper used when you need to transport a full
+    feature map plus identifier metadata in one object.
     """
 
     symbol: str
@@ -33,7 +44,8 @@ class FeatureVector(TypedDict):
     features: Dict[str, float]
 
 
-# A simpler alias used throughout analyst / strategy code.
+# Canonical "feature row" used throughout analyst/strategy code:
+# a mapping of feature_name -> float.
 FeatureMap = Dict[str, float]
 
 
@@ -42,6 +54,10 @@ class AggregatedAllocation(TypedDict):
     Aggregated signal / allocation coming out of the analyst + aggregator stack.
 
     This is the primary input into RM-3 (capital allocator) and RM-4 (posture).
+
+    Conventions:
+    - score is directional: + => long bias, - => short bias
+    - confidence is [0, 1]
     """
 
     # Core required fields
@@ -55,13 +71,15 @@ class AggregatedAllocation(TypedDict):
     strategy: NotRequired[str]
     metadata: NotRequired[Dict[str, Any]]
 
-    # Required by RM-3 and RM-4 (but filled in by upstream components)
+    # Common enrichments used by RM + dashboard layers
     strategy_breakdown: NotRequired[Dict[str, float]]
     target_qty: NotRequired[float]
+    features: NotRequired[FeatureMap]
+    meta: NotRequired[Dict[str, Any]]
 
 
 # -----------------------------------------------------------------------------
-# 2. Predictive risk layer (RM-2)
+# 2) Predictive risk layer (RM-2)
 # -----------------------------------------------------------------------------
 
 
@@ -77,36 +95,51 @@ class PredictivePacket(TypedDict, total=False):
 
     # Vol / drawdown style metrics
     predicted_vol: float  # e.g. annualized or per-bar
-    predicted_drawdown: float  # e.g. expected max drawdown over horizon
+    predicted_drawdown: float  # expected max drawdown over horizon
 
     # Regime / risk scoring
     risk_score: float  # normalized [0, 1] riskiness
     regime: str  # e.g. "bull", "bear", "sideways"
-    confidence: float  # model confidence in the regime / risk score
+    confidence: float  # model confidence in regime / risk score
 
 
 # -----------------------------------------------------------------------------
-# 3. Capital allocation layer (RM-3)
+# 3) Capital allocation layer (RM-3)
 # -----------------------------------------------------------------------------
 
 
 class CapitalAllocPacket(TypedDict, total=False):
     """
-    Capital allocation decision for a single symbol, as produced by RM-3.
+    Capital allocation decision for a single symbol (RM-3 input/output helper).
 
-    This is the bridge between score-space (AggregatedAllocation) and
-    dollar-space / notional limits for execution.
+    This packet is the bridge between score-space (AggregatedAllocation) and
+    dollar-space / notional constraints for execution.
+
+    Canonical field:
+      - target_dollars: signed $ notional desired for the symbol
+
+    Backward compatibility:
+      - some older bridge code used `capital`; we keep it optional.
     """
 
     symbol: str
 
-    # Core decision: how many dollars of book to allocate to this symbol
+    # Canonical decision: signed dollars of exposure to allocate to this symbol
     target_dollars: float
 
+    # Backward-compatible alias (deprecated)
+    capital: NotRequired[float]
+
+    # Useful context (often carried through from AggregatedAllocation)
+    score: NotRequired[float]
+    confidence: NotRequired[float]
+    strategy_breakdown: NotRequired[Dict[str, float]]
+    metadata: NotRequired[Dict[str, Any]]
+
     # Risk-aware annotation (generally derived from RM-2 output)
-    predicted_risk: float  # e.g. per-position risk fraction
-    risk_score: float  # copy-through or transformation of PredictivePacket.risk_score
-    regime: str  # copy-through of PredictivePacket.regime
+    predicted_risk: NotRequired[float]  # e.g. per-position risk fraction
+    risk_score: NotRequired[float]  # copy-through from PredictivePacket.risk_score
+    regime: NotRequired[str]  # copy-through from PredictivePacket.regime
 
     # Optional metadata / audit information
     timestamp: NotRequired[str]
@@ -114,7 +147,7 @@ class CapitalAllocPacket(TypedDict, total=False):
 
 
 # -----------------------------------------------------------------------------
-# 4. Posture, execution filters, portfolio & governance (RM-4+)
+# 4) Posture, execution filters, portfolio & governance (RM-4+)
 # -----------------------------------------------------------------------------
 
 
@@ -145,8 +178,8 @@ class ExecutionPacket(TypedDict, total=False):
     """
     Execution-level risk guidance for a specific intent or order.
 
-    This envelope is used by RM-5 execution filters and by the trader
-    to understand slippage- and impact-aware constraints.
+    This envelope is used by RM-5 execution filters and by the trader to
+    understand slippage- and impact-aware constraints.
     """
 
     symbol: str
@@ -204,7 +237,7 @@ class GovernancePacket(TypedDict, total=False):
 
 
 # -----------------------------------------------------------------------------
-# 5. Unified risk envelope (RM master / orchestrator)
+# 5) Unified risk envelope (RM master / orchestrator)
 # -----------------------------------------------------------------------------
 
 
