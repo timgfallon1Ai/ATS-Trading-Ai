@@ -3,44 +3,74 @@ from __future__ import annotations
 import argparse
 import math
 from datetime import datetime, timedelta
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
-from ats.trader.trader import Trader
-from ats.trader.order_types import Order
 from ats.risk_manager import RiskConfig, RiskManager
+from ats.trader.order_types import Order
+from ats.trader.trader import Trader
 
 from .backtest_config import BacktestConfig
 from .engine import BacktestEngine, BacktestResult
 from .types import Bar
 
 
-def generate_synthetic_bars(
-    symbol: str,
-    days: int = 200,
-    start_price: float = 100.0,
-) -> List[Bar]:
-    """
-    Generate a simple, deterministic synthetic price series.
+class SimpleMAStrategy:
+    """Simple moving-average crossover demo strategy (long/short).
 
-    We use a slow sinusoidal pattern plus a mild trend to make sure
-    the strategy has something to react to, but keep it deterministic
-    so runs are reproducible.
+    This is intentionally simplistic and exists to validate the Backtester2 loop
+    end-to-end (bars -> strategy -> optional risk -> trader -> portfolio).
     """
+
+    def __init__(self, window: int = 20, unit_size: float = 10.0) -> None:
+        self.window = max(2, int(window))
+        self.unit_size = float(unit_size)
+        self._prices: List[float] = []
+        self._position: float = 0.0
+
+    def __call__(self, bar: Bar, trader: Trader) -> Sequence[Order]:
+        self._prices.append(float(bar.close))
+        if len(self._prices) < self.window:
+            return []
+
+        window_prices = self._prices[-self.window :]
+        ma = sum(window_prices) / float(self.window)
+
+        target = 0.0
+        if bar.close > ma:
+            target = self.unit_size
+        elif bar.close < ma:
+            target = -self.unit_size
+
+        delta = target - self._position
+        if abs(delta) < 1e-9:
+            return []
+
+        side = "buy" if delta > 0 else "sell"
+        size = abs(delta)
+
+        self._position = target
+        return [Order(symbol=bar.symbol, side=side, size=size, order_type="market")]
+
+
+def generate_synthetic_bars(
+    *, symbol: str, days: int = 200, start_price: float = 100.0
+) -> List[Bar]:
+    """Generate deterministic, synthetic OHLCV bars for smoke testing."""
     bars: List[Bar] = []
 
     start_dt = datetime(2025, 1, 1, 9, 30)
+    price = float(start_price)
 
-    price = start_price
-    for i in range(days):
-        t = i / 20.0  # frequency of the sine wave
-        drift = 0.05 * i  # slow upward drift
+    for i in range(int(days)):
+        t = i / 20.0
+        drift = 0.05 * i
         delta = 2.0 * math.sin(t)
         close = max(1.0, price + delta + drift / 100.0)
 
         high = close + 0.5
         low = max(0.5, close - 0.5)
         open_ = (high + low) / 2.0
-        volume = 1_000 + i * 10
+        volume = float(1_000 + i * 10)
 
         ts = (start_dt + timedelta(days=i)).isoformat()
 
@@ -48,88 +78,31 @@ def generate_synthetic_bars(
             Bar(
                 timestamp=ts,
                 symbol=symbol,
-                open=open_,
-                high=high,
-                low=low,
-                close=close,
+                open=float(open_),
+                high=float(high),
+                low=float(low),
+                close=float(close),
                 volume=volume,
             )
         )
-
         price = close
 
     return bars
 
 
-class SimpleMAStrategy:
-    """
-    Very simple moving-average crossover-like strategy.
-
-    - Maintains a rolling price window (lookback).
-    - Goes long when price is above the moving average.
-    - Exits to flat when price is below the moving average.
-
-    This is only for proving the data -> strategy -> Trader -> risk ->
-    result pipeline works end-to-end. We'll replace/extend this with real
-    strategies as we move toward production.
-    """
-
-    def __init__(self, lookback: int = 20, unit_size: int = 10) -> None:
-        self.lookback = lookback
-        self.unit_size = unit_size
-        self._prices: List[float] = []
-        self._position: int = 0  # current number of shares
-
-    def __call__(self, bar: Bar, trader: Trader) -> Sequence[Order]:
-        self._prices.append(bar.close)
-
-        if len(self._prices) < self.lookback:
-            return []
-
-        window = self._prices[-self.lookback :]
-        ma = sum(window) / len(window)
-
-        orders: List[Order] = []
-
-        # Long when price > MA, flat when price < MA.
-        if bar.close > ma and self._position <= 0:
-            # Increase position to +unit_size
-            target = self.unit_size
-            delta = target - self._position
-            if delta > 0:
-                orders.append(Order(symbol=bar.symbol, side="buy", size=float(delta)))
-                self._position += delta
-
-        elif bar.close < ma and self._position > 0:
-            # Exit any existing long position
-            delta = self._position
-            orders.append(Order(symbol=bar.symbol, side="sell", size=float(delta)))
-            self._position -= delta
-
-        return orders
-
-
 def run_backtest(
-    symbol: str,
-    days: int = 200,
-    enable_risk: bool = True,
+    *, symbol: str, days: int = 200, enable_risk: bool = True
 ) -> BacktestResult:
-    """
-    Convenience function for running a backtest programmatically.
-    """
+    config = BacktestConfig(symbol=symbol.upper())
 
-    config = BacktestConfig(symbol=symbol)
     trader = Trader(starting_capital=config.starting_capital)
 
-    bars = generate_synthetic_bars(symbol=symbol, days=days)
-    strategy = SimpleMAStrategy()
+    bars = generate_synthetic_bars(symbol=config.symbol, days=days)
+    strategy = SimpleMAStrategy(window=20, unit_size=10.0)
 
-    risk_manager: RiskManager | None
+    risk_manager: RiskManager | None = None
     if enable_risk:
-        risk_cfg = RiskConfig()
-        risk_manager = RiskManager(config=risk_cfg)
-    else:
-        risk_manager = None
+        risk_manager = RiskManager(config=RiskConfig())
 
     engine = BacktestEngine(
         config=config,
@@ -138,29 +111,19 @@ def run_backtest(
         strategy=strategy,
         risk_manager=risk_manager,
     )
-
     return engine.run()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Run a simple synthetic backtest using ats.backtester2.",
-    )
+    parser = argparse.ArgumentParser(description="ATS Backtester2 (T2) demo runner")
+    parser.add_argument("--symbol", default="AAPL", help="Symbol to backtest")
     parser.add_argument(
-        "--symbol",
-        required=True,
-        help="Symbol to backtest (e.g. AAPL).",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=200,
-        help="Number of synthetic daily bars to generate (default: 200).",
+        "--days", type=int, default=200, help="Number of bars to simulate"
     )
     parser.add_argument(
         "--no-risk",
         action="store_true",
-        help="Disable the baseline RiskManager for this run.",
+        help="Disable RiskManager; send strategy orders directly to Trader.",
     )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -171,8 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         enable_risk=not args.no_risk,
     )
 
-    print(f"Backtest complete for {result.config.symbol}")
-    print(f"Bars processed: {args.days}")
+    print("Backtest complete.")
     print(f"Trades executed: {len(result.trade_history)}")
 
     if result.final_portfolio is not None:
