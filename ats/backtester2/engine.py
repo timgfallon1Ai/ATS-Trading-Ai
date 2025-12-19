@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import inspect
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from ats.risk_manager import RiskDecision, RiskManager
@@ -13,70 +14,123 @@ from .types import Bar
 StrategyFn = Callable[[Bar, Trader], Sequence[Order]]
 
 
-@dataclass
+@dataclass(frozen=True)
 class BacktestResult:
-    """Output container for a BacktestEngine run."""
+    """
+    Results returned from BacktestEngine.run().
+
+    Notes:
+      - portfolio_history only appends when Trader returns a dict snapshot that includes
+        a "portfolio" key (to keep coupling loose).
+      - trade_history similarly pulls from "trade_history" if present.
+      - risk_decisions records each RiskManager decision for auditability.
+    """
 
     config: BacktestConfig
-    portfolio_history: List[Dict[str, Any]] = field(default_factory=list)
-    trade_history: List[Dict[str, Any]] = field(default_factory=list)
-    final_portfolio: Optional[Dict[str, Any]] = None
-    risk_decisions: List[RiskDecision] = field(default_factory=list)
+    portfolio_history: List[Dict[str, Any]]
+    trade_history: List[Any]
+    final_portfolio: Optional[Dict[str, Any]]
+    risk_decisions: List[RiskDecision]
 
 
 class BacktestEngine:
-    """Backtest engine: loops over bars, calls strategy, routes orders to Trader."""
+    """
+    Minimal, deterministic backtest loop that wires:
+
+      bars -> strategy(bar, trader) -> (optional) risk_manager -> trader.process_orders()
+
+    The key contract:
+      RiskManager.evaluate_orders(bar, orders) -> RiskDecision
+        - accepted_orders: orders allowed through
+        - rejected_orders: orders blocked (with reasons / metadata handled inside RM)
+    """
 
     def __init__(
         self,
-        *,
         config: BacktestConfig,
         trader: Trader,
         bars: Iterable[Bar],
         strategy: StrategyFn,
-        risk_manager: RiskManager | None = None,
+        risk_manager: Optional[RiskManager] = None,
     ) -> None:
         self.config = config
         self.trader = trader
-        self.bars = list(bars)
+        self._bars = list(bars)
         self.strategy = strategy
         self.risk_manager = risk_manager
 
-    def run(self) -> BacktestResult:
-        """Run the backtest and return the results."""
-        result = BacktestResult(config=self.config)
+    def _process_orders_with_optional_timestamp(
+        self, orders: Sequence[Order], bar: Bar
+    ) -> Any:
+        """
+        Call Trader.process_orders in a way that works whether it supports
+        a timestamp kwarg or not.
 
-        for i, bar in enumerate(self.bars):
-            if self.config.bar_limit is not None and i >= self.config.bar_limit:
+        This keeps the backtester compatible across small Trader API changes
+        while still preferring deterministic timestamps when available.
+        """
+        fn = self.trader.process_orders
+        try:
+            sig = inspect.signature(fn)
+            if "timestamp" in sig.parameters:
+                return fn(orders, timestamp=bar.timestamp)
+        except (TypeError, ValueError):
+            # Some callables may not support signature inspection.
+            pass
+        return fn(orders)
+
+    def run(self) -> BacktestResult:
+        portfolio_history: List[Dict[str, Any]] = []
+        trade_history: List[Any] = []
+        risk_decisions: List[RiskDecision] = []
+
+        for idx, bar in enumerate(self._bars):
+            if self.config.bar_limit is not None and idx >= self.config.bar_limit:
                 break
 
+            # Mark-to-market the trader for this bar's close price.
             self.trader.update_market({bar.symbol: bar.close})
 
-            candidate_orders = list(self.strategy(bar, self.trader))
-            if not candidate_orders:
-                continue
-
-            if self.risk_manager is not None:
-                decision = self.risk_manager.evaluate_orders(
-                    market=bar, orders=candidate_orders
-                )
-                result.risk_decisions.append(decision)
-                orders = list(decision.accepted_orders)
-            else:
-                orders = candidate_orders
-
+            # Strategy decides candidate orders for this bar.
+            orders: Sequence[Order] = self.strategy(bar, self.trader)
             if not orders:
                 continue
 
-            snapshot = self.trader.process_orders(orders)
+            candidate_orders = list(orders)
 
-            portfolio = snapshot.get("portfolio")
-            if isinstance(portfolio, dict):
-                result.portfolio_history.append(portfolio)
-                result.final_portfolio = portfolio
+            # Apply risk gating (Phase 3): evaluate_orders(bar, candidate_orders)
+            if self.risk_manager is not None:
+                decision = self.risk_manager.evaluate_orders(bar, candidate_orders)
+                risk_decisions.append(decision)
 
-            trades = snapshot.get("trade_history")
-            if isinstance(trades, list):
-                result.trade_history.extend(trades)
+                safe_orders = list(decision.accepted_orders)
+                if not safe_orders:
+                    # All orders blocked by risk.
+                    continue
+            else:
+                safe_orders = candidate_orders
 
-        return result
+            # Execute orders through the Trader.
+            result = self._process_orders_with_optional_timestamp(safe_orders, bar)
+
+            # Keep coupling loose: only extract fields if result is dict-like.
+            if isinstance(result, dict):
+                portfolio = result.get("portfolio")
+                if portfolio is not None:
+                    portfolio_history.append(portfolio)
+
+                trades = result.get("trade_history")
+                if trades:
+                    if isinstance(trades, list):
+                        trade_history.extend(trades)
+                    else:
+                        trade_history.append(trades)
+
+        final_portfolio = portfolio_history[-1] if portfolio_history else None
+        return BacktestResult(
+            config=self.config,
+            portfolio_history=portfolio_history,
+            trade_history=trade_history,
+            final_portfolio=final_portfolio,
+            risk_decisions=risk_decisions,
+        )
