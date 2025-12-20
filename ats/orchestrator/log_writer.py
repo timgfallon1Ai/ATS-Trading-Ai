@@ -1,109 +1,128 @@
 from __future__ import annotations
 
 import json
-import os
-import socket
 import traceback
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, Dict, Optional
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _safe_dir(path: Path) -> Path:
-    """Ensure *path* is a directory.
+def default_run_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
 
-    If *path* exists as a FILE, we cannot mkdir() it. In that case, fall back to a
-    sibling directory (e.g. "logs_dir"). This prevents hard crashes like:
-    FileExistsError: [Errno 17] File exists: 'logs'
-    """
-    if str(path).strip() == "":
-        path = Path("logs")
 
-    if path.exists() and path.is_file():
-        # Common culprit: a tracked file named `logs` at repo root.
-        candidate = path.with_name(f"{path.name}_dir")
-        if candidate.exists() and candidate.is_file():
-            candidate = path.with_name(f"{path.name}_dir_{uuid.uuid4().hex[:8]}")
-        path = candidate
-
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+@dataclass(frozen=True)
+class LogPaths:
+    base_dir: Path
+    run_dir: Path
+    events_file: Path
 
 
 class LogWriter:
-    """Unified ATS logging layer.
+    """Structured JSONL logger used by ats.run.
 
-    - Writes JSONL logs for governance events, risk packets, and trade/fill results.
-    - Scopes logs by run_id so multiple runs don't collide.
-    - Robust to a common local-repo mistake: having a FILE named `logs`.
+    Record shape:
+        {
+          "ts": "...",
+          "run_id": "...",
+          "seq": 1,
+          "level": "info" | "error" | "debug",
+          "event": "session_start" | ...,
+          "data": { ... }
+        }
     """
 
     def __init__(
         self,
-        log_dir: Union[str, Path] = "logs",
+        log_dir: str | Path = "logs",
         run_id: Optional[str] = None,
+        filename: str = "events.jsonl",
     ) -> None:
         base = Path(log_dir)
-        self.base_dir = _safe_dir(base)
 
-        self.run_id = run_id or os.environ.get("ATS_RUN_ID") or self._new_run_id()
-        self.run_dir = _safe_dir(self.base_dir / self.run_id)
+        # If a file named "logs" exists (historic repo artifact), avoid crashing.
+        if base.exists() and base.is_file():
+            base = base.with_name(base.name + "_dir")
 
-        # Backwards-compat attribute: some code may read `log_writer.log_dir`
-        self.log_dir = self.run_dir
+        base.mkdir(parents=True, exist_ok=True)
 
-        self._host = socket.gethostname()
-        self._pid = os.getpid()
+        self._run_id = run_id or default_run_id()
+        run_dir = base / self._run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    def _new_run_id(self) -> str:
-        ts = _utc_now().strftime("%Y%m%dT%H%M%SZ")
-        return f"{ts}-{uuid.uuid4().hex[:8]}"
+        self._paths = LogPaths(
+            base_dir=base,
+            run_dir=run_dir,
+            events_file=run_dir / filename,
+        )
+        self._seq = 0
 
-    def _file(self) -> Path:
-        """Daily log file (within the run-scoped directory)."""
-        date = _utc_now().strftime("%Y-%m-%d")
-        return self.run_dir / f"{date}.jsonl"
+    @property
+    def run_id(self) -> str:
+        return self._run_id
 
-    def write(self, record_type: str, payload: Dict[str, Any]) -> None:
-        """Write a single JSONL record."""
-        entry = {
-            "ts": _utc_now().isoformat(),
-            "run_id": self.run_id,
-            "type": record_type,
-            "data": payload,
-            "meta": {"host": self._host, "pid": self._pid},
+    @property
+    def paths(self) -> LogPaths:
+        return self._paths
+
+    def emit(
+        self,
+        event: str,
+        data: Dict[str, Any] | None = None,
+        level: str = "info",
+    ) -> None:
+        self._seq += 1
+        payload = {
+            "ts": _utc_now_iso(),
+            "run_id": self._run_id,
+            "seq": self._seq,
+            "level": level,
+            "event": event,
+            "data": data or {},
         }
 
-        with self._file().open("a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    entry,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    default=str,
-                )
-                + "\n"
-            )
+        with self._paths.events_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-    def write_many(self, record_type: str, items: Iterable[Dict[str, Any]]) -> None:
+    # ---------------------------------------------------------------------
+    # Backwards-compatible API (older code uses `write` and `write_many`)
+    # ---------------------------------------------------------------------
+    def write(self, record_type: str, payload: Dict[str, Any]) -> None:
+        self.emit(event=record_type, data=payload, level="info")
+
+    def write_many(self, record_type: str, items: list[Dict[str, Any]]) -> None:
         for item in items:
             self.write(record_type, item)
 
-    def session_start(self, payload: Optional[Dict[str, Any]] = None) -> None:
-        self.write("session_start", payload or {})
-
-    def session_end(self, payload: Optional[Dict[str, Any]] = None) -> None:
-        self.write("session_end", payload or {})
-
-    def session_error(
-        self, exc: BaseException, payload: Optional[Dict[str, Any]] = None
+    def exception(
+        self,
+        event: str,
+        data: Dict[str, Any] | None = None,
+        exc: BaseException | None = None,
     ) -> None:
-        data = dict(payload or {})
-        data["error"] = repr(exc)
-        data["traceback"] = traceback.format_exc()
-        self.write("session_error", data)
+        """Emit an error event including exception metadata."""
+        if exc is None:
+            tb = traceback.format_exc()
+            exc_type = None
+            exc_msg = None
+        else:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            exc_type = type(exc).__name__
+            exc_msg = str(exc)
+
+        merged = dict(data or {})
+        merged.update(
+            {
+                "exc_type": exc_type,
+                "exc_msg": exc_msg,
+                "traceback": tb,
+            }
+        )
+        self.emit(event=event, data=merged, level="error")

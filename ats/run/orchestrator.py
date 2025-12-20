@@ -1,127 +1,104 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from ats.run.service_registry import ServiceRegistry
+from ats.backtester2.run import run_backtest as bt2_run_backtest
+from ats.orchestrator.log_writer import LogWriter
+
+if TYPE_CHECKING:
+    from ats.backtester2.engine import BacktestResult
 
 
 @dataclass(frozen=True)
-class BacktestRequest:
-    """Parameters for a backtest run."""
-
+class BacktestRunConfig:
     symbol: str
     days: int = 200
-    starting_cash: float = 100000.0
-    no_risk: bool = False
+    enable_risk: bool = True
 
 
-class Orchestrator:
-    """Unified runtime orchestrator (backtest-first).
+class RuntimeOrchestrator:
+    """Unified orchestrator used by `python -m ats.run`.
 
-    Today this module primarily provides a stable entrypoint and an execution
-    surface to:
-      - run Backtester2 deterministically,
-      - emit JSONL logs (via ats.orchestrator.log_writer.LogWriter).
-
-    Later phases can extend this to PAPER/LIVE loops without changing the
-    backtest contract.
+    Currently: backtest-first (Backtester2).
+    Later: paper/live trading loops can be added behind the same interface.
     """
 
-    def __init__(self, registry: ServiceRegistry, run_id: Optional[str] = None):
-        self._reg = registry
-        self._run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    def __init__(self, log: LogWriter) -> None:
+        self._log = log
 
     @property
-    def run_id(self) -> str:
-        return self._run_id
+    def log(self) -> LogWriter:
+        return self._log
 
-    def _emit(self, record_type: str, payload: Dict[str, Any]) -> None:
-        logger = self._reg.get("log")
-        if logger is None:
-            return
-        try:
-            logger.write(record_type, payload)
-        except Exception:
-            # Logging must never break trading/backtesting.
-            return
-
-    def run_backtest(self, req: BacktestRequest) -> Any:
-        """Run a Backtester2 job and emit start/end events."""
-
-        self._emit(
+    def run_backtest(self, cfg: BacktestRunConfig) -> "BacktestResult":
+        self._log.emit(
             "session_start",
             {
-                "run_id": self._run_id,
-                "mode": "BACKTEST",
-                "symbol": req.symbol,
-                "days": req.days,
-                "starting_cash": req.starting_cash,
-                "risk_enabled": (not req.no_risk),
+                "mode": "backtest",
+                "symbol": cfg.symbol,
+                "days": cfg.days,
+                "risk_enabled": cfg.enable_risk,
             },
         )
 
-        from ats.backtester2 import run as bt_run  # local import to avoid cycles
+        status = "success"
+        result: Optional["BacktestResult"] = None
 
-        if not hasattr(bt_run, "run_backtest"):
-            raise RuntimeError("ats.backtester2.run.run_backtest() not found")
+        try:
+            result = bt2_run_backtest(
+                symbol=cfg.symbol,
+                days=cfg.days,
+                enable_risk=cfg.enable_risk,
+            )
 
-        fn = bt_run.run_backtest
-        sig = inspect.signature(fn)
+            summary: Dict[str, Any] = {
+                "symbol": result.config.symbol,
+                "days": cfg.days,
+                "trades": len(result.trade_history),
+                "risk_evaluations": len(result.risk_decisions),
+            }
 
-        kwargs: Dict[str, Any] = {}
-        if "symbol" in sig.parameters:
-            kwargs["symbol"] = req.symbol
-        if "days" in sig.parameters:
-            kwargs["days"] = int(req.days)
+            if result.final_portfolio is not None:
+                summary["final_portfolio"] = result.final_portfolio
 
-        # Support a few likely naming conventions without forcing one.
-        if "starting_cash" in sig.parameters:
-            kwargs["starting_cash"] = float(req.starting_cash)
-        elif "starting_capital" in sig.parameters:
-            kwargs["starting_capital"] = float(req.starting_cash)
-        elif "capital" in sig.parameters:
-            kwargs["capital"] = float(req.starting_cash)
+            if result.risk_decisions:
+                blocked = sum(len(d.rejected_orders) for d in result.risk_decisions)
+                summary["risk_blocked_orders"] = blocked
 
-        if "no_risk" in sig.parameters:
-            kwargs["no_risk"] = bool(req.no_risk)
-        elif "risk_enabled" in sig.parameters:
-            kwargs["risk_enabled"] = bool(not req.no_risk)
-        elif "enable_risk" in sig.parameters:
-            kwargs["enable_risk"] = bool(not req.no_risk)
+            self._log.emit("backtest_complete", summary)
+            return result
 
-        result = fn(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            status = "error"
+            self._log.exception(
+                "session_error",
+                {
+                    "mode": "backtest",
+                    "symbol": cfg.symbol,
+                    "days": cfg.days,
+                    "risk_enabled": cfg.enable_risk,
+                },
+                exc=exc,
+            )
+            raise
 
-        summary = self._summarize_backtest_result(result)
-        self._emit(
-            "session_end",
-            {
-                "run_id": self._run_id,
-                "mode": "BACKTEST",
-                "symbol": req.symbol,
-                "summary": summary,
-            },
+        finally:
+            self._log.emit(
+                "session_end",
+                {
+                    "mode": "backtest",
+                    "symbol": cfg.symbol,
+                    "status": status,
+                    "had_result": result is not None,
+                },
+            )
+
+    def run_live(self) -> None:
+        raise NotImplementedError(
+            "Live runtime not implemented yet. Use `ats.run backtest` for now."
         )
-        return result
 
-    def _summarize_backtest_result(self, result: Any) -> Dict[str, Any]:
-        """Best-effort result summary (robust to minor schema changes)."""
 
-        trade_hist = getattr(result, "trade_history", None)
-        if trade_hist is None:
-            trade_hist = getattr(result, "trades", None)
-
-        final_pf = getattr(result, "final_portfolio", None)
-        if final_pf is None:
-            final_pf = getattr(result, "portfolio", None)
-
-        cfg = getattr(result, "config", None)
-        symbol = getattr(cfg, "symbol", None) if cfg is not None else None
-
-        return {
-            "symbol": symbol,
-            "trades": len(trade_hist) if isinstance(trade_hist, list) else None,
-            "final_portfolio": final_pf,
-        }
+# Backwards-compat alias (if any older imports reference Orchestrator)
+Orchestrator = RuntimeOrchestrator
