@@ -1,39 +1,42 @@
+# ------------------------------------------------------------
 # Python
+# ------------------------------------------------------------
+.venv/
+venv/
 __pycache__/
-*.py[cod]
-*.pyd
-*.pyo
-*.so
-*.egg-info/
-build/
-dist/
-.eggs/
+*.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
-htmlcov/
+dist/
+build/
+*.egg-info/
 
-# Virtual environments
-.venv/
-venv/
-ENV/
-env/
-
-# IDE / Editor
-.vscode/
-.idea/
-
-# OS / Finder
+# ------------------------------------------------------------
+# OS / editor
+# ------------------------------------------------------------
 .DS_Store
 
+# ------------------------------------------------------------
+# Env / secrets
+# ------------------------------------------------------------
+.env
+ats/config/keys.yaml
+ats/config/keys.yml
+keys.yaml
+keys.yml
+
+# ------------------------------------------------------------
 # Logs / artifacts
+# ------------------------------------------------------------
 logs/
-analyst_logs/
+logs
 *.log
 *.jsonl
+analyst_logs/
+ats/analyst.zip
 
-# Local secrets / keys
-keys.yaml
-.env
-.env.*
+# ------------------------------------------------------------
+# Reports / diagnostics
+# ------------------------------------------------------------
+pyright_report.json
