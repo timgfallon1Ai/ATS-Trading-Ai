@@ -1,118 +1,111 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional
 
 from ats.backtester2.run import run_backtest as bt2_run_backtest
-from ats.core.kill_switch import read_kill_switch_status
+from ats.core.kill_switch import kill_switch_status
 from ats.orchestrator.log_writer import LogWriter
 
-if TYPE_CHECKING:
-    from ats.backtester2.engine import BacktestResult
+
+def _as_dict(obj: Any) -> Dict[str, Any]:
+    """
+    Best-effort conversion of status-ish objects into JSONable dicts.
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        try:
+            v = to_dict()
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+
+    if hasattr(obj, "__dict__"):
+        try:
+            return dict(obj.__dict__)
+        except Exception:
+            pass
+
+    return {"value": str(obj)}
 
 
 @dataclass(frozen=True)
 class BacktestRunConfig:
-    symbol: str
+    symbol: str = "AAPL"
     days: int = 200
     enable_risk: bool = True
+
+    # Backtester2 passthroughs
+    csv: Optional[str] = None
+    strategy: str = "ma"
+    strategy_names: Optional[List[str]] = None
+    max_position_frac: float = 0.2
+
+
+@dataclass(frozen=True)
+class LiveRunConfig:
+    symbol: Optional[str] = None
+    paper: bool = True
 
 
 class RuntimeOrchestrator:
     """
-    Unified orchestrator used by `python -m ats.run`.
-
-    Phase9.3:
-      - Logs kill-switch status at session start
-      - Backtest loop honors kill-switch inside BacktestEngine (checked every bar)
+    Lightweight runtime wrapper that:
+      - records run_start/run_end events to JSONL
+      - calls Backtester2 programmatically
     """
 
+    BacktestRunConfig = BacktestRunConfig
+    LiveRunConfig = LiveRunConfig
+
     def __init__(self, log: LogWriter) -> None:
-        self._log = log
+        self.log = log
 
-    @property
-    def log(self) -> LogWriter:
-        return self._log
+    def run_backtest(self, cfg: BacktestRunConfig):
+        st = kill_switch_status()
+        self.log.event("session_status", meta={"kill_switch": _as_dict(st)})
 
-    def run_backtest(self, cfg: BacktestRunConfig) -> "BacktestResult":
-        ks = read_kill_switch_status()
-
-        self._log.emit(
-            "session_start",
-            {
+        self.log.event(
+            "run_start",
+            meta={
                 "mode": "backtest",
                 "symbol": cfg.symbol,
                 "days": cfg.days,
-                "risk_enabled": cfg.enable_risk,
-                "kill_switch": {
-                    "engaged": ks.engaged,
-                    "forced_by_env": ks.forced_by_env,
-                    "file_exists": ks.file_exists,
-                    "path": str(ks.path),
-                    "enabled_at": ks.enabled_at,
-                    "reason": ks.reason,
-                },
+                "enable_risk": cfg.enable_risk,
+                "csv": cfg.csv,
+                "strategy": cfg.strategy,
+                "strategy_names": cfg.strategy_names,
+                "max_position_frac": cfg.max_position_frac,
             },
         )
 
-        status = "success"
-        result: Optional["BacktestResult"] = None
-
         try:
-            result = bt2_run_backtest(
+            res = bt2_run_backtest(
                 symbol=cfg.symbol,
                 days=cfg.days,
                 enable_risk=cfg.enable_risk,
+                csv=cfg.csv,
+                strategy=cfg.strategy,
+                strategy_names=cfg.strategy_names,
+                max_position_frac=cfg.max_position_frac,
             )
-
-            summary: Dict[str, Any] = {
-                "symbol": cfg.symbol,
-                "days": cfg.days,
-                "trades": len(result.trade_history),
-                "risk_evaluations": len(result.risk_decisions),
-            }
-            if result.final_portfolio is not None:
-                summary["final_portfolio"] = result.final_portfolio
-
-            self._log.emit("backtest_complete", summary)
-            return result
-
-        except Exception as exc:  # noqa: BLE001
-            status = "error"
-            self._log.exception(
-                "session_error",
-                {"mode": "backtest", "symbol": cfg.symbol, "days": cfg.days},
-                exc=exc,
+            self.log.event("run_end", meta={"mode": "backtest", "status": "ok"})
+            return res
+        except Exception as e:
+            self.log.event(
+                "run_end",
+                meta={"mode": "backtest", "status": "error", "error": str(e)},
             )
             raise
 
-        finally:
-            self._log.emit(
-                "session_end",
-                {
-                    "mode": "backtest",
-                    "symbol": cfg.symbol,
-                    "status": status,
-                    "had_result": result is not None,
-                },
-            )
-
-    def run_live(self) -> None:
-        ks = read_kill_switch_status()
-        if ks.engaged:
-            self._log.emit(
-                "kill_switch_block_live",
-                {
-                    "path": str(ks.path),
-                    "reason": ks.reason,
-                    "enabled_at": ks.enabled_at,
-                },
-            )
-            raise SystemExit(f"Kill switch engaged at {ks.path}. Live run blocked.")
-
-        raise NotImplementedError(
-            "Live runtime not implemented yet. Use `ats.run backtest` for now."
-        )
-
-
-Orchestrator = RuntimeOrchestrator
+    def run_live(self, cfg: Optional[LiveRunConfig] = None) -> None:
+        _ = cfg or LiveRunConfig()
+        self.log.event("run_start", meta={"mode": "live"})
+        self.log.event("run_end", meta={"mode": "live", "status": "noop"})
+        print("Live mode is not implemented yet.")
