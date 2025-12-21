@@ -1,12 +1,9 @@
-cat > ats / backtester2 / run.py << "EOF"
 import argparse
 import math
 from datetime import datetime, timedelta
 from typing import List, Optional, Sequence
 
 from ats.risk_manager import RiskConfig, RiskManager
-from ats.trader.order_types import Order
-from ats.trader.trader import Trader
 
 from .backtest_config import BacktestConfig
 from .engine import BacktestEngine, BacktestResult
@@ -14,10 +11,11 @@ from .types import Bar
 
 
 def generate_synthetic_bars(
-    symbol: str,
-    days: int = 200,
-    start_price: float = 100.0,
+    symbol: str, days: int = 200, start_price: float = 100.0
 ) -> List[Bar]:
+    """
+    Deterministic synthetic OHLCV series so runs are reproducible.
+    """
     bars: List[Bar] = []
     start_dt = datetime(2025, 1, 1, 9, 30)
 
@@ -31,10 +29,9 @@ def generate_synthetic_bars(
         high = close + 0.5
         low = max(0.5, close - 0.5)
         open_ = (high + low) / 2.0
-        volume = 1_000 + i * 10
+        volume = 1000 + i * 10
 
         ts = (start_dt + timedelta(days=i)).isoformat()
-
         bars.append(
             Bar(
                 timestamp=ts,
@@ -52,33 +49,54 @@ def generate_synthetic_bars(
 
 
 class SimpleMAStrategy:
-    def __init__(self, lookback: int = 20, unit_size: int = 10) -> None:
+    """
+    Legacy baseline strategy (kept as a known-good debug reference).
+    """
+
+    def __init__(self, lookback: int = 20, unit_size: float = 10.0) -> None:
         self.lookback = int(lookback)
-        self.unit_size = int(unit_size)
+        self.unit_size = float(unit_size)
         self._prices: List[float] = []
         self._position: float = 0.0
 
-    def __call__(self, bar: Bar, trader: Trader) -> Sequence[Order]:
+    def __call__(self, bar, trader):
+        from ats.trader.order_types import Order
+
         self._prices.append(float(bar.close))
         if len(self._prices) < self.lookback:
             return []
 
         window = self._prices[-self.lookback :]
         ma = sum(window) / float(len(window))
+        price = float(bar.close)
 
-        orders: List[Order] = []
+        orders = []
 
-        if float(bar.close) > ma and self._position <= 0:
-            target = float(self.unit_size)
+        if price > ma and self._position <= 0.0:
+            target = self.unit_size
             delta = target - self._position
             if delta > 0:
-                orders.append(Order(symbol=bar.symbol, side="buy", size=float(delta)))
+                orders.append(
+                    Order(
+                        symbol=bar.symbol,
+                        side="buy",
+                        size=float(delta),
+                        order_type="market",
+                    )
+                )
                 self._position += delta
 
-        elif float(bar.close) < ma and self._position > 0:
+        elif price < ma and self._position > 0.0:
             delta = self._position
             if delta > 0:
-                orders.append(Order(symbol=bar.symbol, side="sell", size=float(delta)))
+                orders.append(
+                    Order(
+                        symbol=bar.symbol,
+                        side="sell",
+                        size=float(delta),
+                        order_type="market",
+                    )
+                )
                 self._position -= delta
 
         return orders
@@ -101,14 +119,28 @@ def run_backtest(
     strategy: str = "ma",
     strategy_names: Optional[Sequence[str]] = None,
     max_position_frac: float = 0.20,
+    **kwargs,
 ) -> BacktestResult:
-    # Keep config minimal and compatible with existing Backtester2 design
+    """
+    Programmatic entry point.
+
+    NOTE: kwargs is accepted for compatibility with older wrappers that might
+    pass extra fields (we ignore what we don't understand).
+    """
+    # Support legacy alias: no_risk=True
+    if "no_risk" in kwargs and isinstance(kwargs["no_risk"], bool):
+        enable_risk = not kwargs["no_risk"]
+
     config = BacktestConfig(symbol=symbol, starting_capital=100_000.0, bar_limit=None)
+    bars = generate_synthetic_bars(symbol=symbol, days=int(days))
+
+    # Trader is created inside BacktestEngine in this repo version OR passed in.
+    # Your current engine expects trader passed in (per earlier phases), so we do that.
+    from ats.trader.trader import Trader
+
     trader = Trader(
         starting_capital=float(getattr(config, "starting_capital", 100_000.0))
     )
-
-    bars = generate_synthetic_bars(symbol=symbol, days=int(days))
     risk_manager = RiskManager(RiskConfig()) if enable_risk else None
 
     strategy_key = (strategy or "ma").strip().lower()
@@ -130,38 +162,35 @@ def run_backtest(
         config=config,
         trader=trader,
         bars=bars,
-        strategy=strat,  # BacktestEngine expects a callable strategy
+        strategy=strat,
         risk_manager=risk_manager,
     )
     return engine.run()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Run a synthetic backtest using ats.backtester2.",
-    )
-    parser.add_argument("--symbol", required=True, help="Symbol (e.g. AAPL).")
+    parser = argparse.ArgumentParser(description="Run Backtester2 (synthetic bars).")
+    parser.add_argument("--symbol", required=True, help="Symbol (e.g. AAPL)")
     parser.add_argument(
-        "--days", type=int, default=200, help="Bars to generate (default: 200)."
+        "--days", type=int, default=200, help="Number of bars (default: 200)"
     )
-    parser.add_argument("--no-risk", action="store_true", help="Disable RiskManager.")
+    parser.add_argument(
+        "--no-risk", action="store_true", help="Disable the risk manager"
+    )
 
     parser.add_argument(
-        "--strategy",
-        choices=["ma", "ensemble"],
-        default="ma",
-        help="Strategy mode (default: ma).",
+        "--strategy", choices=["ma", "ensemble"], default="ma", help="Strategy mode"
     )
     parser.add_argument(
         "--strategies",
         default=None,
-        help="Comma-separated analyst strategy names (ensemble only). Default: all.",
+        help="Comma-separated analyst strategy names (ensemble only)",
     )
     parser.add_argument(
         "--max-position-frac",
         type=float,
         default=0.20,
-        help="Max position fraction of capital base (ensemble only).",
+        help="Sizing cap (ensemble only)",
     )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -180,8 +209,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("Final portfolio snapshot:")
     print(result.final_portfolio)
 
-    if result.risk_decisions:
-        blocked = sum(len(d.rejected_orders) for d in result.risk_decisions)
+    if getattr(result, "risk_decisions", None):
+        blocked = 0
+        try:
+            blocked = sum(
+                len(d.get("rejected_orders", [])) for d in result.risk_decisions
+            )
+        except Exception:
+            blocked = 0
         print(f"Risk manager evaluated {len(result.risk_decisions)} bars.")
         print(f"Orders blocked by risk: {blocked}")
 
@@ -190,4 +225,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-EOF

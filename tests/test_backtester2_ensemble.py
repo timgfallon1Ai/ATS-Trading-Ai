@@ -1,4 +1,3 @@
-cat > tests / test_backtester2_ensemble.py << "EOF"
 import subprocess
 import sys
 
@@ -28,6 +27,3 @@ def test_backtester2_cli_accepts_strategy_flag() -> None:
     p = subprocess.run(cmd, capture_output=True, text=True)
     assert p.returncode == 0, (p.stdout, p.stderr)
     assert "Backtest complete" in (p.stdout + p.stderr)
-
-
-EOF

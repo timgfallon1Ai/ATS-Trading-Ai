@@ -1,4 +1,3 @@
-cat > ats / backtester2 / ensemble_strategy.py << "EOF"
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -14,12 +13,6 @@ from .types import Bar
 
 @dataclass(frozen=True)
 class EnsembleStrategyConfig:
-    """
-    AnalystEngine -> Aggregator -> (optional RM3 weights) -> Orders.
-
-    max_position_frac is applied to the capital base used for sizing.
-    """
-
     strategy_names: Optional[Sequence[str]] = None
     max_position_frac: float = 0.20
     min_trade_qty: float = 1.0
@@ -73,16 +66,6 @@ def _current_qty(trader: Any, snap: Dict[str, Any], symbol: str) -> float:
 
 
 class EnsembleStrategy:
-    """
-    Callable strategy for BacktestEngine.
-
-    Maintains a rolling history DataFrame (OHLCV) and generates
-    market orders toward a target position derived from:
-      - AnalystEngine aggregated score/confidence
-      - Aggregator direction mapping
-      - optional RiskManager.run_allocation_batch weights
-    """
-
     def __init__(
         self,
         symbol: str,
@@ -95,13 +78,7 @@ class EnsembleStrategy:
 
         self.analyst = AnalystEngine(strategies=make_strategies(config.strategy_names))
         self.aggregator = Aggregator(config=AggregatorConfig())
-
         self._rows: List[Dict[str, Any]] = []
-
-        # Debug/telemetry
-        self.last_allocation: Optional[Dict[str, Any]] = None
-        self.last_signal: Optional[Dict[str, Any]] = None
-        self.last_signed_weight: float = 0.0
 
     def _history_df(self) -> pd.DataFrame:
         df = pd.DataFrame(self._rows)
@@ -131,7 +108,6 @@ class EnsembleStrategy:
             profit_equity = _safe_float(pools.get("profit_equity"), 0.0)
 
         aggressive_enabled = bool(snap.get("aggressive_enabled", False))
-
         base = (
             principal_floor_f + profit_equity
             if aggressive_enabled
@@ -146,24 +122,20 @@ class EnsembleStrategy:
     ) -> float:
         if self.risk_manager is None or not self.config.use_risk_weights:
             return 1.0
-
         if not hasattr(self.risk_manager, "run_allocation_batch"):
             return 1.0
-
         try:
             weights = self.risk_manager.run_allocation_batch(
-                normalized_allocations,
-                base_capital=base_capital,
+                normalized_allocations, base_capital=base_capital
             )
             if isinstance(weights, dict):
                 w = _safe_float(weights.get(self.symbol, 1.0), 1.0)
                 return max(0.0, min(1.0, abs(w)))
         except Exception:
             pass
-
         return 1.0
 
-    def __call__(self, bar: Bar, trader: Any) -> Sequence[Order]:
+    def __call__(self, bar: Bar, trader: Any):
         self._rows.append(
             {
                 "timestamp": bar.timestamp,
@@ -179,17 +151,17 @@ class EnsembleStrategy:
         ts = _to_pd_timestamp(bar.timestamp)
 
         alloc_obj = self.analyst.evaluate(self.symbol, df, ts)
-
-        if isinstance(alloc_obj, dict):
-            alloc: Dict[str, Any] = dict(alloc_obj)
-        else:
-            alloc = dict(getattr(alloc_obj, "__dict__", {}))
+        alloc: Dict[str, Any] = (
+            dict(alloc_obj)
+            if isinstance(alloc_obj, dict)
+            else dict(getattr(alloc_obj, "__dict__", {}))
+        )
 
         batch = self.aggregator.prepare_batch([alloc])
         combined_signals = batch.get("combined_signals") or []
         normalized_allocs = batch.get("allocations") or []
 
-        signal: Dict[str, Any] = combined_signals[0] if combined_signals else {}
+        signal = combined_signals[0] if combined_signals else {}
         direction = str(signal.get("direction", "flat"))
         score = _safe_float(signal.get("score", alloc.get("score", 0.0)), 0.0)
         confidence = _safe_float(
@@ -199,13 +171,7 @@ class EnsembleStrategy:
         if not self.config.allow_short and direction == "short":
             direction = "flat"
 
-        if direction == "long":
-            sign = 1.0
-        elif direction == "short":
-            sign = -1.0
-        else:
-            sign = 0.0
-
+        sign = 1.0 if direction == "long" else (-1.0 if direction == "short" else 0.0)
         intensity = min(1.0, abs(score) * max(0.0, min(1.0, confidence)))
 
         price = float(bar.close)
@@ -228,10 +194,6 @@ class EnsembleStrategy:
 
         current_qty = _current_qty(trader, snap, self.symbol)
         delta_qty = target_qty - current_qty
-
-        self.last_allocation = alloc
-        self.last_signal = dict(signal)
-        self.last_signed_weight = signed_weight
 
         if abs(delta_qty) < float(self.config.min_trade_qty):
             return []
@@ -257,6 +219,3 @@ class EnsembleStrategy:
                 },
             )
         ]
-
-
-EOF
