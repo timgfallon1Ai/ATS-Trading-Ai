@@ -1,6 +1,4 @@
 cat > ats / backtester2 / run.py << "EOF"
-from __future__ import annotations
-
 import argparse
 import math
 from datetime import datetime, timedelta
@@ -86,6 +84,16 @@ class SimpleMAStrategy:
         return orders
 
 
+def _parse_strategy_names(raw: Optional[str]) -> Optional[Sequence[str]]:
+    if raw is None:
+        return None
+    raw_s = str(raw).strip()
+    if not raw_s:
+        return None
+    parts = [p.strip() for p in raw_s.split(",") if p.strip()]
+    return parts or None
+
+
 def run_backtest(
     symbol: str,
     days: int = 200,
@@ -94,11 +102,13 @@ def run_backtest(
     strategy_names: Optional[Sequence[str]] = None,
     max_position_frac: float = 0.20,
 ) -> BacktestResult:
+    # Keep config minimal and compatible with existing Backtester2 design
     config = BacktestConfig(symbol=symbol, starting_capital=100_000.0, bar_limit=None)
-    trader = Trader(starting_capital=float(config.starting_capital))
+    trader = Trader(
+        starting_capital=float(getattr(config, "starting_capital", 100_000.0))
+    )
 
     bars = generate_synthetic_bars(symbol=symbol, days=int(days))
-
     risk_manager = RiskManager(RiskConfig()) if enable_risk else None
 
     strategy_key = (strategy or "ma").strip().lower()
@@ -120,20 +130,10 @@ def run_backtest(
         config=config,
         trader=trader,
         bars=bars,
-        strategy=strat,  # type: ignore[arg-type]
+        strategy=strat,  # BacktestEngine expects a callable strategy
         risk_manager=risk_manager,
     )
     return engine.run()
-
-
-def _parse_strategy_names(raw: Optional[str]) -> Optional[Sequence[str]]:
-    if raw is None:
-        return None
-    raw_s = str(raw).strip()
-    if not raw_s:
-        return None
-    parts = [p.strip() for p in raw_s.split(",") if p.strip()]
-    return parts or None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

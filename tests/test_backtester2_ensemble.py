@@ -1,6 +1,4 @@
 cat > tests / test_backtester2_ensemble.py << "EOF"
-from __future__ import annotations
-
 import subprocess
 import sys
 

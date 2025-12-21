@@ -1,6 +1,4 @@
 cat > ats / backtester2 / ensemble_strategy.py << "EOF"
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -244,7 +242,7 @@ class EnsembleStrategy:
         return [
             Order(
                 symbol=self.symbol,
-                side=side,  # type: ignore[arg-type]
+                side=side,
                 size=float(size),
                 order_type="market",
                 meta={
