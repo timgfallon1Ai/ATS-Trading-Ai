@@ -7,15 +7,13 @@ from ats.risk_manager import RiskConfig, RiskManager
 
 from .backtest_config import BacktestConfig
 from .engine import BacktestEngine, BacktestResult
+from .metrics import compute_backtest_metrics
 from .types import Bar
 
 
 def generate_synthetic_bars(
     symbol: str, days: int = 200, start_price: float = 100.0
 ) -> List[Bar]:
-    """
-    Deterministic synthetic OHLCV series so runs are reproducible.
-    """
     bars: List[Bar] = []
     start_dt = datetime(2025, 1, 1, 9, 30)
 
@@ -49,10 +47,6 @@ def generate_synthetic_bars(
 
 
 class SimpleMAStrategy:
-    """
-    Legacy baseline strategy (kept as a known-good debug reference).
-    """
-
     def __init__(self, lookback: int = 20, unit_size: float = 10.0) -> None:
         self.lookback = int(lookback)
         self.unit_size = float(unit_size)
@@ -71,7 +65,6 @@ class SimpleMAStrategy:
         price = float(bar.close)
 
         orders = []
-
         if price > ma and self._position <= 0.0:
             target = self.unit_size
             delta = target - self._position
@@ -119,23 +112,22 @@ def run_backtest(
     strategy: str = "ma",
     strategy_names: Optional[Sequence[str]] = None,
     max_position_frac: float = 0.20,
+    csv: Optional[str] = None,
     **kwargs,
 ) -> BacktestResult:
-    """
-    Programmatic entry point.
-
-    NOTE: kwargs is accepted for compatibility with older wrappers that might
-    pass extra fields (we ignore what we don't understand).
-    """
     # Support legacy alias: no_risk=True
     if "no_risk" in kwargs and isinstance(kwargs["no_risk"], bool):
         enable_risk = not kwargs["no_risk"]
 
     config = BacktestConfig(symbol=symbol, starting_capital=100_000.0, bar_limit=None)
-    bars = generate_synthetic_bars(symbol=symbol, days=int(days))
 
-    # Trader is created inside BacktestEngine in this repo version OR passed in.
-    # Your current engine expects trader passed in (per earlier phases), so we do that.
+    if csv:
+        from .data_sources import load_bars_from_csv
+
+        bars = load_bars_from_csv(csv, symbol=symbol)
+    else:
+        bars = generate_synthetic_bars(symbol=symbol, days=int(days))
+
     from ats.trader.trader import Trader
 
     trader = Trader(
@@ -169,10 +161,20 @@ def run_backtest(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Run Backtester2 (synthetic bars).")
+    parser = argparse.ArgumentParser(
+        description="Run Backtester2 (synthetic bars or CSV)."
+    )
     parser.add_argument("--symbol", required=True, help="Symbol (e.g. AAPL)")
     parser.add_argument(
-        "--days", type=int, default=200, help="Number of bars (default: 200)"
+        "--days",
+        type=int,
+        default=200,
+        help="Bars to generate if --csv not set (default: 200)",
+    )
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help="Path to OHLCV CSV (overrides --days synthetic generator)",
     )
     parser.add_argument(
         "--no-risk", action="store_true", help="Disable the risk manager"
@@ -202,6 +204,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         strategy=str(args.strategy),
         strategy_names=_parse_strategy_names(args.strategies),
         max_position_frac=float(args.max_position_frac),
+        csv=str(args.csv) if args.csv else None,
     )
 
     print("Backtest complete.")
@@ -209,14 +212,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("Final portfolio snapshot:")
     print(result.final_portfolio)
 
+    # Metrics (from portfolio_history)
+    m = compute_backtest_metrics(result.portfolio_history)
+    print("Performance metrics:")
+    print(f"  Bars:         {m.n_bars}")
+    print(f"  Total return: {m.total_return * 100:.2f}%")
+    print(f"  Max DD:       {m.max_drawdown * 100:.2f}%")
+    print(f"  Sharpe:       {m.sharpe:.2f}")
+
+    # Risk decision summary (robust to dict or dataclass)
     if getattr(result, "risk_decisions", None):
         blocked = 0
-        try:
-            blocked = sum(
-                len(d.get("rejected_orders", [])) for d in result.risk_decisions
-            )
-        except Exception:
-            blocked = 0
+        for d in result.risk_decisions:
+            if isinstance(d, dict):
+                blocked += len(d.get("rejected_orders", []) or [])
+            else:
+                blocked += len(getattr(d, "rejected_orders", []) or [])
         print(f"Risk manager evaluated {len(result.risk_decisions)} bars.")
         print(f"Orders blocked by risk: {blocked}")
 
