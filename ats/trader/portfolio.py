@@ -1,305 +1,279 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Mapping
+from typing import Dict, Iterable, Mapping, Optional
 
 from .fill_types import Fill
-from .position_book import PositionBook
 
 
-def _sign(x: float) -> int:
-    if x > 0:
-        return 1
-    if x < 0:
-        return -1
-    return 0
+@dataclass
+class Position:
+    """Signed position. Positive = long, Negative = short."""
+
+    quantity: float = 0.0
+    avg_price: float = 0.0
+    mark_price: float = 0.0
+
+    def market_value(self) -> float:
+        return float(self.quantity) * float(self.mark_price)
+
+    def unrealized_pnl(self) -> float:
+        # Works for both long and short because quantity is signed.
+        return (float(self.mark_price) - float(self.avg_price)) * float(self.quantity)
 
 
 @dataclass
 class Portfolio:
     """
-    Portfolio bookkeeping for the "thin trader" (T1).
+    Profit-focused portfolio with principal floor + profit pool.
 
-    This module is intentionally **execution-agnostic**:
-    - It does not decide what to trade (that's Analyst/Aggregator/RM).
-    - It only applies fills and produces a valuation snapshot.
+    Key ideas:
+      - principal_floor: your protected capital baseline (default = starting_cash)
+      - equity = cash + net_exposure
+      - profit_equity = max(0, equity - principal_floor)
+      - aggressive_enabled turns on once profit_equity >= aggressive_profit_threshold
+      - halted becomes True if equity falls below principal_floor (breach)
 
-    Key features:
-    - Supports long AND short positions (signed quantities).
-    - Correct realized P&L when reducing/closing/reversing positions.
-    - Optional fee model (bps + per-share).
-    - Convenience metrics for risk/monitoring (equity, exposure, unrealized P&L).
-    - "Two-pool" telemetry helpers:
-        * `principal_floor` (protected principal baseline)
-        * computed principal/profit equity buckets
-        * `aggressive_enabled` flag based on realized P&L threshold
-
-    Notes on the "two-pool" concept:
-    This class does NOT enforce your RM7 principal shield rules (that's risk_manager's job).
-    It does provide consistent accounting signals so RM7/monitoring can enforce invariants.
+    Notes:
+      - This Portfolio supports long and short positions.
+      - Fees are supported via optional `fill.fee` (if present); execution engine may omit.
     """
 
     starting_cash: float = 100_000.0
 
-    # --- Principal / profits telemetry (does not enforce risk) ---
-    principal_floor: float | None = None
-    aggressive_rpl_threshold: float = 1_000.0  # "aggressive mode above +$1k RPL"
+    aggressive_profit_threshold: float = 1_000.0
+    floor_breach_tolerance: float = 1e-6
 
-    # --- Fee model ---
-    fee_bps: float = 0.0  # charged on notional, e.g., 1.0 = 1bp
-    fee_per_share: float = 0.0  # charged on abs(shares)
-
-    # If True, allow cash to go negative (margin-style backtests).
-    allow_negative_cash: bool = True
-
-    # --- Runtime state ---
     cash: float = field(init=False)
-    realized_pnl: float = field(init=False)
-    fees_paid: float = field(init=False)
-    positions: PositionBook = field(init=False)
+    principal_floor: float = field(init=False)
+
+    realized_pnl: float = field(default=0.0, init=False)
+    fees_paid: float = field(default=0.0, init=False)
+
+    positions: Dict[str, Position] = field(default_factory=dict, init=False)
+
+    aggressive_enabled: bool = field(default=False, init=False)
+    halted: bool = field(default=False, init=False)
+    halted_reason: Optional[str] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.cash = float(self.starting_cash)
-        self.realized_pnl = 0.0
-        self.fees_paid = 0.0
-        self.positions = PositionBook()
+        self.principal_floor = float(self.starting_cash)
 
-        if self.principal_floor is None:
-            # Default: treat the starting cash as the protected principal baseline.
-            self.principal_floor = float(self.starting_cash)
+    # ---------------------------------------------------------------------
+    # Position helpers
+    # ---------------------------------------------------------------------
+    def _pos(self, symbol: str) -> Position:
+        if symbol not in self.positions:
+            self.positions[symbol] = Position()
+        return self.positions[symbol]
 
-    # ------------------------------------------------------------------ #
-    # Fees
-    # ------------------------------------------------------------------ #
+    def mark_to_market(self, prices: Mapping[str, float]) -> None:
+        """Update mark prices from a {symbol: price} map."""
+        for sym, px in prices.items():
+            if sym in self.positions:
+                self.positions[sym].mark_price = float(px)
 
-    def _fee_for_fill(self, fill: Fill) -> float:
-        """
-        Compute fees for a fill.
+    # ---------------------------------------------------------------------
+    # Core math
+    # ---------------------------------------------------------------------
+    def net_exposure(self) -> float:
+        return sum(p.market_value() for p in self.positions.values())
 
-        - fee_bps applies to abs(notional) (buy/sell same fee magnitude).
-        - fee_per_share applies to abs(size).
-        """
-        notional_abs = abs(fill.size * fill.price)
-        fee = 0.0
-        if self.fee_bps:
-            fee += notional_abs * (self.fee_bps / 10_000.0)
-        if self.fee_per_share:
-            fee += abs(fill.size) * self.fee_per_share
-        return float(fee)
-
-    # ------------------------------------------------------------------ #
-    # Fill application
-    # ------------------------------------------------------------------ #
-
-    def apply_fill(self, fill: Fill) -> None:
-        """
-        Apply a single execution fill to the portfolio.
-
-        Conventions:
-        - Position quantities are signed:
-            long  => quantity > 0
-            short => quantity < 0
-        - Fill.size must be positive.
-        """
-        if fill.size <= 0:
-            raise ValueError("Fill.size must be positive")
-
-        pos = self.positions.get(fill.symbol)
-        old_qty = float(pos.quantity)
-
-        # Cash moves on every fill (simple cash model).
-        if fill.side == "buy":
-            self.cash -= fill.size * fill.price
-            qty_delta = float(fill.size)
-        elif fill.side == "sell":
-            self.cash += fill.size * fill.price
-            qty_delta = -float(fill.size)
-        else:
-            raise ValueError(f"Invalid Fill.side: {fill.side!r}")
-
-        # Apply fees immediately (fees reduce equity and realized P&L).
-        fee = self._fee_for_fill(fill)
-        if fee:
-            self.cash -= fee
-            self.fees_paid += fee
-            self.realized_pnl -= fee
-
-        # No existing position -> open new.
-        if old_qty == 0.0:
-            pos.quantity = qty_delta
-            pos.avg_price = float(fill.price) if qty_delta != 0.0 else 0.0
-            self._enforce_cash_constraint()
-            return
-
-        new_qty = old_qty + qty_delta
-
-        # Case 1: Increasing same-direction position (no realized P&L).
-        if _sign(old_qty) == _sign(new_qty) and abs(new_qty) > abs(old_qty):
-            total_abs = abs(old_qty) + abs(qty_delta)
-            # Weighted average entry price using absolute sizes.
-            pos.avg_price = (
-                abs(old_qty) * pos.avg_price + abs(qty_delta) * fill.price
-            ) / max(total_abs, 1e-12)
-            pos.quantity = new_qty
-            self._enforce_cash_constraint()
-            return
-
-        # Case 2: Reducing position (partial close) or closing/reversing.
-        # Closing quantity is the amount that offsets the existing position.
-        closing_qty = min(abs(old_qty), abs(qty_delta))
-
-        # Realized P&L:
-        # long close via sell:  (exit - entry) * qty
-        # short close via buy:  (entry - exit) * qty
-        realized = (
-            closing_qty * (fill.price - pos.avg_price) * (1.0 if old_qty > 0 else -1.0)
+    def gross_exposure(self) -> float:
+        return sum(
+            abs(float(p.quantity)) * float(p.mark_price)
+            for p in self.positions.values()
         )
-        self.realized_pnl += float(realized)
 
-        if new_qty == 0.0:
-            # Fully flat.
-            pos.quantity = 0.0
-            pos.avg_price = 0.0
-            self._enforce_cash_constraint()
-            return
+    def unrealized_pnl(self) -> float:
+        return sum(p.unrealized_pnl() for p in self.positions.values())
 
-        if _sign(old_qty) == _sign(new_qty):
-            # Partial close but still same direction -> avg_price unchanged.
-            pos.quantity = new_qty
-            self._enforce_cash_constraint()
-            return
+    def equity(self) -> float:
+        return float(self.cash) + float(self.net_exposure())
 
-        # Reversal: close old position fully, open new remainder in opposite direction at fill.price.
-        pos.quantity = new_qty
-        pos.avg_price = float(fill.price)
-        self._enforce_cash_constraint()
+    def _recompute_pools_and_flags(self) -> None:
+        eq = self.equity()
 
-    def apply_fills(self, fills: list[Fill]) -> None:
-        """Apply a batch of fills in-order."""
-        for fill in fills:
-            self.apply_fill(fill)
+        profit_equity = max(0.0, eq - float(self.principal_floor))
+        self.aggressive_enabled = profit_equity >= float(
+            self.aggressive_profit_threshold
+        )
 
-    def _enforce_cash_constraint(self) -> None:
-        if self.allow_negative_cash:
-            return
-        if self.cash < -1e-6:
-            raise ValueError(
-                f"Cash went negative ({self.cash:.2f}) with allow_negative_cash=False"
-            )
+        # Halt if we breach principal floor beyond tolerance.
+        if eq < float(self.principal_floor) - float(self.floor_breach_tolerance):
+            self.halted = True
+            self.halted_reason = f"principal_floor_breach equity={eq:.6f} < floor={self.principal_floor:.6f}"
+            # If principal is breached, aggressive must be disabled.
+            self.aggressive_enabled = False
+        else:
+            self.halted = False
+            self.halted_reason = None
 
-    # ------------------------------------------------------------------ #
-    # Valuation / risk telemetry
-    # ------------------------------------------------------------------ #
-
-    def positions_value(self, prices: Mapping[str, float]) -> float:
-        """Marked-to-market signed value of positions: sum(quantity * price)."""
-        value = 0.0
-        for symbol, pos in self.positions.all().items():
-            if pos.quantity == 0:
-                continue
-            px = float(prices.get(symbol, pos.avg_price))
-            value += float(pos.quantity) * px
-        return float(value)
-
-    def unrealized_pnl(self, prices: Mapping[str, float]) -> float:
-        """
-        Mark-to-market unrealized P&L of open positions.
-
-        Works for long and short via the identity:
-            unrealized = (mark - avg) * quantity
-        (quantity is signed).
-        """
-        pnl = 0.0
-        for symbol, pos in self.positions.all().items():
-            if pos.quantity == 0:
-                continue
-            px = float(prices.get(symbol, pos.avg_price))
-            pnl += (px - float(pos.avg_price)) * float(pos.quantity)
-        return float(pnl)
-
-    def equity(self, prices: Mapping[str, float]) -> float:
-        """Total equity = cash + marked-to-market position value."""
-        return float(self.cash + self.positions_value(prices))
-
-    def gross_exposure(self, prices: Mapping[str, float]) -> float:
-        """Gross exposure = sum(abs(quantity * price))."""
-        gross = 0.0
-        for symbol, pos in self.positions.all().items():
-            if pos.quantity == 0:
-                continue
-            px = float(prices.get(symbol, pos.avg_price))
-            gross += abs(float(pos.quantity) * px)
-        return float(gross)
-
-    def net_exposure(self, prices: Mapping[str, float]) -> float:
-        """Net exposure = sum(quantity * price)."""
-        return float(self.positions_value(prices))
-
-    # ------------------------------------------------------------------ #
-    # Principal / profit helpers (telemetry only)
-    # ------------------------------------------------------------------ #
-
-    @property
-    def aggressive_enabled(self) -> bool:
-        """True if realized P&L crosses the configured threshold."""
-        return bool(self.realized_pnl >= float(self.aggressive_rpl_threshold))
-
-    def equity_pools(self, prices: Mapping[str, float]) -> Dict[str, float]:
-        """
-        Return (principal_equity, profit_equity) buckets based on current equity.
-
-        principal_equity is capped at `principal_floor` (your protected baseline).
-        profit_equity is any equity above that floor.
-
-        This is a *telemetry* decomposition — it does not enforce trading rules.
-        """
-        floor = float(self.principal_floor or 0.0)
-        eq = self.equity(prices)
-        principal_equity = min(eq, floor)
-        profit_equity = max(0.0, eq - floor)
+    def pools(self) -> Dict[str, float]:
+        """Return principal/profit pools based on current equity."""
+        eq = self.equity()
+        principal_equity = min(eq, float(self.principal_floor))
+        profit_equity = max(0.0, eq - float(self.principal_floor))
         return {
-            "principal_floor": floor,
+            "principal_floor": float(self.principal_floor),
             "principal_equity": float(principal_equity),
             "profit_equity": float(profit_equity),
         }
 
-    # ------------------------------------------------------------------ #
-    # Serialization
-    # ------------------------------------------------------------------ #
+    # ---------------------------------------------------------------------
+    # Fill application (supports long/short + flipping)
+    # ---------------------------------------------------------------------
+    def apply_fills(self, fills: Iterable[Fill]) -> None:
+        """
+        Apply fills to cash + positions.
 
+        Conventions:
+          - Buy increases quantity, reduces cash.
+          - Sell decreases quantity, increases cash.
+          - Realized PnL is computed when reducing/closing/flip.
+          - Optional `fill.fee` (if present) is subtracted from cash and realized_pnl.
+        """
+        for f in fills:
+            symbol = str(f.symbol)
+            price = float(f.price)
+            size = float(f.size)
+
+            if size <= 0.0:
+                continue
+
+            side = getattr(f, "side", None)
+            if side not in ("buy", "sell"):
+                raise ValueError(f"Unexpected fill.side={side!r}")
+
+            delta_qty = size if side == "buy" else -size
+            fee = float(getattr(f, "fee", 0.0) or 0.0)
+
+            # Cash moves opposite signed notional.
+            # Fill.notional is + for buy, - for sell.
+            self.cash -= float(f.notional)
+            if fee != 0.0:
+                self.cash -= fee
+                self.fees_paid += fee
+                self.realized_pnl -= fee
+
+            pos = self._pos(symbol)
+            old_qty = float(pos.quantity)
+            old_avg = float(pos.avg_price)
+
+            # Update position logic
+            if abs(old_qty) < 1e-12:
+                # Opening a fresh position
+                pos.quantity = float(delta_qty)
+                pos.avg_price = float(price)
+                pos.mark_price = float(price)
+                continue
+
+            new_qty = old_qty + float(delta_qty)
+
+            # Case A: same direction add (increase magnitude, same sign)
+            if (old_qty > 0 and delta_qty > 0) or (old_qty < 0 and delta_qty < 0):
+                # Weighted avg by absolute size
+                old_abs = abs(old_qty)
+                add_abs = abs(delta_qty)
+                new_abs = abs(new_qty)
+                if new_abs <= 0.0:
+                    pos.quantity = 0.0
+                    pos.avg_price = 0.0
+                else:
+                    pos.avg_price = (old_avg * old_abs + price * add_abs) / new_abs
+                    pos.quantity = new_qty
+                pos.mark_price = float(price)
+                continue
+
+            # Case B: reducing/closing/flip (opposite direction trade)
+            if old_qty > 0 and delta_qty < 0:
+                # Selling a long
+                close_qty = min(old_qty, abs(delta_qty))
+                self.realized_pnl += (price - old_avg) * close_qty
+
+                if new_qty > 1e-12:
+                    # Still long
+                    pos.quantity = new_qty
+                    # avg stays same for remaining shares
+                    pos.avg_price = old_avg
+                elif abs(new_qty) <= 1e-12:
+                    # Flat
+                    pos.quantity = 0.0
+                    pos.avg_price = 0.0
+                else:
+                    # Flipped to short
+                    pos.quantity = new_qty  # negative
+                    pos.avg_price = price
+                pos.mark_price = float(price)
+                continue
+
+            if old_qty < 0 and delta_qty > 0:
+                # Buying to cover a short
+                close_qty = min(abs(old_qty), delta_qty)
+                self.realized_pnl += (old_avg - price) * close_qty
+
+                if new_qty < -1e-12:
+                    # Still short
+                    pos.quantity = new_qty
+                    pos.avg_price = old_avg
+                elif abs(new_qty) <= 1e-12:
+                    # Flat
+                    pos.quantity = 0.0
+                    pos.avg_price = 0.0
+                else:
+                    # Flipped to long
+                    pos.quantity = new_qty  # positive
+                    pos.avg_price = price
+                pos.mark_price = float(price)
+                continue
+
+            # If we get here, something is inconsistent.
+            raise RuntimeError(
+                f"Unhandled position transition old_qty={old_qty}, delta_qty={delta_qty}"
+            )
+
+    # ---------------------------------------------------------------------
+    # Snapshot for logs/UI/backtests
+    # ---------------------------------------------------------------------
     def snapshot(self, prices: Mapping[str, float]) -> Dict[str, object]:
         """
-        Return a JSON-serializable snapshot of portfolio state.
-
-        This is designed to be safe for logs/dashboards.
+        Return a fully-serializable snapshot matching your current CLI output shape.
         """
-        pos_out: Dict[str, Dict[str, float]] = {}
-        for symbol, pos in self.positions.all().items():
-            if pos.quantity == 0:
-                continue
-            mark = float(prices.get(symbol, pos.avg_price))
-            pos_out[symbol] = {
-                "quantity": float(pos.quantity),
-                "avg_price": float(pos.avg_price),
-                "mark_price": mark,
-                "market_value": float(pos.quantity) * mark,
-                "unrealized_pnl": (mark - float(pos.avg_price)) * float(pos.quantity),
-            }
+        self.mark_to_market(prices)
+        self._recompute_pools_and_flags()
 
-        eq = self.equity(prices)
-        pools = self.equity_pools(prices)
+        eq = self.equity()
+        gross = self.gross_exposure()
+        net = self.net_exposure()
+        unreal = self.unrealized_pnl()
+        pools = self.pools()
+
+        positions_out: Dict[str, Dict[str, float]] = {}
+        for sym, p in self.positions.items():
+            if abs(float(p.quantity)) < 1e-12:
+                continue
+            positions_out[sym] = {
+                "quantity": float(p.quantity),
+                "avg_price": float(p.avg_price),
+                "mark_price": float(p.mark_price),
+                "market_value": float(p.market_value()),
+                "unrealized_pnl": float(p.unrealized_pnl()),
+            }
 
         return {
             "cash": float(self.cash),
             "starting_cash": float(self.starting_cash),
-            "principal_floor": float(self.principal_floor or 0.0),
+            "principal_floor": float(self.principal_floor),
             "realized_pnl": float(self.realized_pnl),
-            "unrealized_pnl": float(self.unrealized_pnl(prices)),
+            "unrealized_pnl": float(unreal),
             "fees_paid": float(self.fees_paid),
             "equity": float(eq),
-            "gross_exposure": float(self.gross_exposure(prices)),
-            "net_exposure": float(self.net_exposure(prices)),
+            "gross_exposure": float(gross),
+            "net_exposure": float(net),
             "aggressive_enabled": bool(self.aggressive_enabled),
+            "halted": bool(self.halted),
+            "halted_reason": self.halted_reason,
             "pools": pools,
-            "positions": pos_out,
+            "positions": positions_out,
         }
