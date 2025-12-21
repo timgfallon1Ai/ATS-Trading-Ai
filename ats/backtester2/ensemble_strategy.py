@@ -49,18 +49,38 @@ def _portfolio_snapshot(trader: Any, prices: Dict[str, float]) -> Dict[str, Any]
 
 
 def _current_qty(trader: Any, snap: Dict[str, Any], symbol: str) -> float:
-    positions = snap.get("positions")
-    if isinstance(positions, dict):
-        pos = positions.get(symbol)
-        if isinstance(pos, dict) and "quantity" in pos:
-            return _safe_float(pos.get("quantity"), 0.0)
+    """
+    Source of truth order:
+      1) Trader.portfolio.positions (object model)
+      2) snapshot["positions"][symbol]["quantity"] (dict model)
+    """
+    sym_keys = [symbol, str(symbol).upper(), str(symbol).lower()]
 
     portfolio = getattr(trader, "portfolio", None)
     if portfolio is not None:
-        pmap = getattr(portfolio, "positions", None)
-        if isinstance(pmap, dict) and symbol in pmap:
-            p = pmap[symbol]
-            return _safe_float(getattr(p, "quantity", 0.0), 0.0)
+        # Common convenience method
+        if hasattr(portfolio, "position_qty"):
+            for s in sym_keys:
+                try:
+                    return _safe_float(portfolio.position_qty(s), 0.0)
+                except Exception:
+                    pass
+
+        positions_obj = getattr(portfolio, "positions", None)
+        if isinstance(positions_obj, dict):
+            for s in sym_keys:
+                if s in positions_obj:
+                    pos = positions_obj[s]
+                    if isinstance(pos, dict):
+                        return _safe_float(pos.get("quantity"), 0.0)
+                    return _safe_float(getattr(pos, "quantity", 0.0), 0.0)
+
+    positions = snap.get("positions")
+    if isinstance(positions, dict):
+        for s in sym_keys:
+            pos = positions.get(s)
+            if isinstance(pos, dict) and "quantity" in pos:
+                return _safe_float(pos.get("quantity"), 0.0)
 
     return 0.0
 
