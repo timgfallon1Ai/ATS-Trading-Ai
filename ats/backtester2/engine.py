@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import inspect
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+from ats.core.kill_switch import kill_switch_engaged
 from ats.risk_manager import RiskDecision, RiskManager
 from ats.trader.order_types import Order
 from ats.trader.trader import Trader
@@ -76,6 +77,29 @@ class BacktestEngine:
             pass
         return fn(orders)
 
+    def _record_trader_result(
+        self,
+        result: Any,
+        *,
+        portfolio_history: List[Dict[str, Any]],
+        trade_history: List[Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(result, dict):
+            return None
+
+        portfolio = result.get("portfolio")
+        if isinstance(portfolio, dict):
+            portfolio_history.append(portfolio)
+
+        trades = result.get("trade_history")
+        if trades:
+            if isinstance(trades, list):
+                trade_history.extend(trades)
+            else:
+                trade_history.append(trades)
+
+        return portfolio if isinstance(portfolio, dict) else None
+
     def run(self) -> BacktestResult:
         portfolio_history: List[Dict[str, Any]] = []
         trade_history: List[Any] = []
@@ -85,17 +109,33 @@ class BacktestEngine:
             if self.config.bar_limit is not None and idx >= self.config.bar_limit:
                 break
 
+            # Update market first (so flatten uses current bar close).
             self.trader.update_market({bar.symbol: bar.close})
 
-            # Snapshot BEFORE strategy/risk so RM can enforce principal-floor / exposure caps.
             prices = self._safe_market_snapshot()
             if bar.symbol not in prices:
                 prices[bar.symbol] = float(bar.close)
 
             portfolio_snapshot = self._safe_portfolio_snapshot(prices)
 
+            # ------------------------------------------------------------------
+            # Phase9.3 kill-switch: checked every bar ("orchestrator cycle")
+            # If engaged: flatten positions and stop.
+            # ------------------------------------------------------------------
+            if kill_switch_engaged():
+                result = self.trader.flatten_positions(
+                    timestamp=bar.timestamp, meta_reason="kill_switch"
+                )
+                self._record_trader_result(
+                    result,
+                    portfolio_history=portfolio_history,
+                    trade_history=trade_history,
+                )
+                break
+
             candidate_orders = list(self.strategy(bar, self.trader))
             if not candidate_orders:
+                # Still record portfolio periodically if you want; currently we keep minimal.
                 continue
 
             if self.risk_manager is not None:
@@ -112,18 +152,25 @@ class BacktestEngine:
                 safe_orders = candidate_orders
 
             result = self._process_orders_with_optional_timestamp(safe_orders, bar)
+            last_portfolio = self._record_trader_result(
+                result,
+                portfolio_history=portfolio_history,
+                trade_history=trade_history,
+            )
 
-            if isinstance(result, dict):
-                portfolio = result.get("portfolio")
-                if isinstance(portfolio, dict):
-                    portfolio_history.append(portfolio)
-
-                trades = result.get("trade_history")
-                if trades:
-                    if isinstance(trades, list):
-                        trade_history.extend(trades)
-                    else:
-                        trade_history.append(trades)
+            # ------------------------------------------------------------------
+            # If portfolio is halted (principal floor breach), flatten and stop.
+            # ------------------------------------------------------------------
+            if isinstance(last_portfolio, dict) and bool(last_portfolio.get("halted")):
+                flat = self.trader.flatten_positions(
+                    timestamp=bar.timestamp, meta_reason="portfolio_halted"
+                )
+                self._record_trader_result(
+                    flat,
+                    portfolio_history=portfolio_history,
+                    trade_history=trade_history,
+                )
+                break
 
         final_portfolio = portfolio_history[-1] if portfolio_history else None
         return BacktestResult(

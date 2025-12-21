@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from ats.backtester2.run import run_backtest as bt2_run_backtest
+from ats.core.kill_switch import read_kill_switch_status
 from ats.orchestrator.log_writer import LogWriter
 
 if TYPE_CHECKING:
@@ -18,10 +19,12 @@ class BacktestRunConfig:
 
 
 class RuntimeOrchestrator:
-    """Unified orchestrator used by `python -m ats.run`.
+    """
+    Unified orchestrator used by `python -m ats.run`.
 
-    Currently: backtest-first (Backtester2).
-    Later: paper/live trading loops can be added behind the same interface.
+    Phase9.3:
+      - Logs kill-switch status at session start
+      - Backtest loop honors kill-switch inside BacktestEngine (checked every bar)
     """
 
     def __init__(self, log: LogWriter) -> None:
@@ -32,6 +35,8 @@ class RuntimeOrchestrator:
         return self._log
 
     def run_backtest(self, cfg: BacktestRunConfig) -> "BacktestResult":
+        ks = read_kill_switch_status()
+
         self._log.emit(
             "session_start",
             {
@@ -39,6 +44,14 @@ class RuntimeOrchestrator:
                 "symbol": cfg.symbol,
                 "days": cfg.days,
                 "risk_enabled": cfg.enable_risk,
+                "kill_switch": {
+                    "engaged": ks.engaged,
+                    "forced_by_env": ks.forced_by_env,
+                    "file_exists": ks.file_exists,
+                    "path": str(ks.path),
+                    "enabled_at": ks.enabled_at,
+                    "reason": ks.reason,
+                },
             },
         )
 
@@ -53,18 +66,13 @@ class RuntimeOrchestrator:
             )
 
             summary: Dict[str, Any] = {
-                "symbol": result.config.symbol,
+                "symbol": cfg.symbol,
                 "days": cfg.days,
                 "trades": len(result.trade_history),
                 "risk_evaluations": len(result.risk_decisions),
             }
-
             if result.final_portfolio is not None:
                 summary["final_portfolio"] = result.final_portfolio
-
-            if result.risk_decisions:
-                blocked = sum(len(d.rejected_orders) for d in result.risk_decisions)
-                summary["risk_blocked_orders"] = blocked
 
             self._log.emit("backtest_complete", summary)
             return result
@@ -73,12 +81,7 @@ class RuntimeOrchestrator:
             status = "error"
             self._log.exception(
                 "session_error",
-                {
-                    "mode": "backtest",
-                    "symbol": cfg.symbol,
-                    "days": cfg.days,
-                    "risk_enabled": cfg.enable_risk,
-                },
+                {"mode": "backtest", "symbol": cfg.symbol, "days": cfg.days},
                 exc=exc,
             )
             raise
@@ -95,10 +98,21 @@ class RuntimeOrchestrator:
             )
 
     def run_live(self) -> None:
+        ks = read_kill_switch_status()
+        if ks.engaged:
+            self._log.emit(
+                "kill_switch_block_live",
+                {
+                    "path": str(ks.path),
+                    "reason": ks.reason,
+                    "enabled_at": ks.enabled_at,
+                },
+            )
+            raise SystemExit(f"Kill switch engaged at {ks.path}. Live run blocked.")
+
         raise NotImplementedError(
             "Live runtime not implemented yet. Use `ats.run backtest` for now."
         )
 
 
-# Backwards-compat alias (if any older imports reference Orchestrator)
 Orchestrator = RuntimeOrchestrator
