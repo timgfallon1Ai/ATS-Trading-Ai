@@ -16,16 +16,6 @@ StrategyFn = Callable[[Bar, Trader], Sequence[Order]]
 
 @dataclass(frozen=True)
 class BacktestResult:
-    """
-    Results returned from BacktestEngine.run().
-
-    Notes:
-      - portfolio_history only appends when Trader returns a dict snapshot that includes
-        a "portfolio" key (to keep coupling loose).
-      - trade_history similarly pulls from "trade_history" if present.
-      - risk_decisions records each RiskManager decision for auditability.
-    """
-
     config: BacktestConfig
     portfolio_history: List[Dict[str, Any]]
     trade_history: List[Any]
@@ -34,17 +24,6 @@ class BacktestResult:
 
 
 class BacktestEngine:
-    """
-    Minimal, deterministic backtest loop that wires:
-
-      bars -> strategy(bar, trader) -> (optional) risk_manager -> trader.process_orders()
-
-    The key contract:
-      RiskManager.evaluate_orders(bar, orders) -> RiskDecision
-        - accepted_orders: orders allowed through
-        - rejected_orders: orders blocked (with reasons / metadata handled inside RM)
-    """
-
     def __init__(
         self,
         config: BacktestConfig,
@@ -59,23 +38,41 @@ class BacktestEngine:
         self.strategy = strategy
         self.risk_manager = risk_manager
 
+    def _safe_market_snapshot(self) -> Dict[str, float]:
+        market = getattr(self.trader, "market", None)
+        if market is not None and hasattr(market, "snapshot"):
+            try:
+                snap = market.snapshot()
+                if isinstance(snap, dict):
+                    return {str(k): float(v) for k, v in snap.items()}
+            except Exception:
+                pass
+        return {}
+
+    def _safe_portfolio_snapshot(
+        self, prices: Dict[str, float]
+    ) -> Optional[Dict[str, Any]]:
+        portfolio = getattr(self.trader, "portfolio", None)
+        if portfolio is None:
+            return None
+        if hasattr(portfolio, "snapshot"):
+            try:
+                snap = portfolio.snapshot(prices)
+                if isinstance(snap, dict):
+                    return snap
+            except Exception:
+                return None
+        return None
+
     def _process_orders_with_optional_timestamp(
         self, orders: Sequence[Order], bar: Bar
     ) -> Any:
-        """
-        Call Trader.process_orders in a way that works whether it supports
-        a timestamp kwarg or not.
-
-        This keeps the backtester compatible across small Trader API changes
-        while still preferring deterministic timestamps when available.
-        """
         fn = self.trader.process_orders
         try:
             sig = inspect.signature(fn)
             if "timestamp" in sig.parameters:
                 return fn(orders, timestamp=bar.timestamp)
         except (TypeError, ValueError):
-            # Some callables may not support signature inspection.
             pass
         return fn(orders)
 
@@ -88,35 +85,37 @@ class BacktestEngine:
             if self.config.bar_limit is not None and idx >= self.config.bar_limit:
                 break
 
-            # Mark-to-market the trader for this bar's close price.
             self.trader.update_market({bar.symbol: bar.close})
 
-            # Strategy decides candidate orders for this bar.
-            orders: Sequence[Order] = self.strategy(bar, self.trader)
-            if not orders:
+            # Snapshot BEFORE strategy/risk so RM can enforce principal-floor / exposure caps.
+            prices = self._safe_market_snapshot()
+            if bar.symbol not in prices:
+                prices[bar.symbol] = float(bar.close)
+
+            portfolio_snapshot = self._safe_portfolio_snapshot(prices)
+
+            candidate_orders = list(self.strategy(bar, self.trader))
+            if not candidate_orders:
                 continue
 
-            candidate_orders = list(orders)
-
-            # Apply risk gating (Phase 3): evaluate_orders(bar, candidate_orders)
             if self.risk_manager is not None:
-                decision = self.risk_manager.evaluate_orders(bar, candidate_orders)
+                decision = self.risk_manager.evaluate_orders(
+                    bar,
+                    candidate_orders,
+                    portfolio=portfolio_snapshot,
+                )
                 risk_decisions.append(decision)
-
                 safe_orders = list(decision.accepted_orders)
                 if not safe_orders:
-                    # All orders blocked by risk.
                     continue
             else:
                 safe_orders = candidate_orders
 
-            # Execute orders through the Trader.
             result = self._process_orders_with_optional_timestamp(safe_orders, bar)
 
-            # Keep coupling loose: only extract fields if result is dict-like.
             if isinstance(result, dict):
                 portfolio = result.get("portfolio")
-                if portfolio is not None:
+                if isinstance(portfolio, dict):
                     portfolio_history.append(portfolio)
 
                 trades = result.get("trade_history")
