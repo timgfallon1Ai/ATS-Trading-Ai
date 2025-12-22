@@ -152,7 +152,29 @@ def _count_blocked_orders(risk_decisions: Any) -> int:
 
 
 def _print_run_logs_hint(args: Any, reg: Any) -> None:
-    # Prefer registry hints if present
+    """Print the concrete JSONL log path for this run.
+
+    The pipeline test accepts either:
+      - a directory containing events.jsonl, or
+      - the events.jsonl file itself.
+
+    We prefer the LogWriter instance because it knows the generated run_id.
+    """
+    # Prefer the LogWriter service registered at boot ("log")
+    try:
+        log = reg["log"]  # type: ignore[index]
+        lp = (
+            getattr(log, "path", None)
+            or getattr(log, "events_path", None)
+            or getattr(log, "log_dir", None)
+        )
+        if lp:
+            print(f"Run logs: {lp}")
+            return
+    except Exception:
+        pass
+
+    # Fallbacks (older registry implementations)
     lp = getattr(reg, "log_path", None) or getattr(reg, "run_log_path", None)
     if lp:
         print(f"Run logs: {lp}")
