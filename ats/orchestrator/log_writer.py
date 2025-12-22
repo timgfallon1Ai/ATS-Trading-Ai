@@ -1,114 +1,122 @@
+"""
+Structured JSONL logger for ATS.
+
+Writes:
+  <base_log_dir>/<run_id>/events.jsonl
+
+Each line is a single JSON object. This logger must never crash the runtime
+due to non-JSON-native types (e.g., pathlib.Path, datetime, UUID, exceptions).
+"""
+
 from __future__ import annotations
 
 import json
-import os
 import uuid
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 def _utc_now_iso() -> str:
-    # Always UTC, always timezone-aware
-    return datetime.now(timezone.utc).isoformat()
+    # Example: 2025-12-21T21:37:34.123456Z
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _default_run_id() -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{ts}-{uuid.uuid4().hex[:8]}"
+def _json_default(obj: Any) -> Any:
+    """
+    json.dumps(default=...) hook.
+
+    Converts common non-serializable objects into safe JSON representations.
+    """
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, datetime):
+        # Ensure timezone-safe output if tz-aware
+        try:
+            return obj.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return obj.isoformat()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if is_dataclass(obj):
+        try:
+            return asdict(obj)
+        except Exception:
+            return str(obj)
+    if isinstance(obj, BaseException):
+        return {
+            "type": obj.__class__.__name__,
+            "message": str(obj),
+        }
+
+    # Last resort: stringify unknown objects rather than failing the run
+    return str(obj)
 
 
 class LogWriter:
     """
-    Unified ATS JSONL logger.
+    Append-only JSONL event logger.
 
-    Design goals:
-    - Create run-scoped log directory: <log_dir>/<run_id>/events.jsonl
-    - Provide a modern `.event(...)` API used by ats.run runtime orchestration
-    - Keep backward compatibility with older `.write(...)` / `.write_many(...)` usage
-    - Be resilient if `log_dir` is accidentally a FILE (rename out of the way)
+    Public API used by ats.run:
+      - event(name, meta=..., **fields)
     """
 
     def __init__(self, log_dir: str | Path = "logs", run_id: Optional[str] = None):
         base = Path(log_dir)
-
-        # If someone accidentally created "logs" as a FILE, move it aside so we can mkdir.
-        if base.exists() and base.is_file():
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            backup = base.with_name(f"{base.name}.file.{ts}")
-            base.rename(backup)
-
-        base.mkdir(parents=True, exist_ok=True)
-
-        # Prefer explicit run_id, then env override, then generated.
-        resolved_run_id = run_id or os.getenv("ATS_RUN_ID") or _default_run_id()
+        rid = run_id or self._generate_run_id()
 
         self.base_dir: Path = base
-        self.run_id: str = resolved_run_id
-        self.run_dir: Path = self.base_dir / self.run_id
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.run_id: str = str(rid)
+        self.log_dir: Path = self.base_dir / self.run_id
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        self.events_path: Path = self.run_dir / "events.jsonl"
+        self.events_path: Path = self.log_dir / "events.jsonl"
 
-    @property
-    def path(self) -> Path:
-        """Back-compat alias used by some callers."""
-        return self.events_path
+    @staticmethod
+    def _generate_run_id() -> str:
+        # Keep consistent with prior runs: <UTCSTAMP>-<8hex>
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"{stamp}-{uuid.uuid4().hex[:8]}"
 
     def _append(self, entry: Mapping[str, Any]) -> None:
-        # Ensure directory exists even if someone deleted it mid-run.
-        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure directory exists even if external cleanup happens mid-run.
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         with self.events_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(dict(entry), ensure_ascii=False) + "\n")
+            f.write(
+                json.dumps(
+                    dict(entry),
+                    ensure_ascii=False,
+                    default=_json_default,
+                )
+                + "\n"
+            )
 
-    # ---------------------------------------------------------------------
-    # New API (used by ats.run runtime)
-    # ---------------------------------------------------------------------
-    def event(
-        self,
-        event_type: str,
-        *,
-        meta: Optional[Mapping[str, Any]] = None,
-        level: str = "INFO",
-        **fields: Any,
-    ) -> None:
+    def event(self, name: str, meta: Any = None, **fields: Any) -> Dict[str, Any]:
         """
-        Write a structured event.
+        Write an event line.
 
-        Example:
-            log.event("session_status", meta={"kill_switch": {...}})
+        - name: event name
+        - meta: any metadata payload (dict recommended, but can be any object)
+        - fields: extra top-level fields (level, msg, counts, etc)
         """
         entry: Dict[str, Any] = {
             "ts": _utc_now_iso(),
             "run_id": self.run_id,
-            "type": event_type,
-            "level": level,
-            "meta": dict(meta) if meta else {},
+            "event": str(name),
         }
-        if fields:
-            entry.update(fields)
+
+        if meta is not None:
+            entry["meta"] = meta
+
+        # allow caller to add top-level fields (level, msg, durations, etc)
+        for k, v in fields.items():
+            entry[str(k)] = v
 
         self._append(entry)
+        return entry
 
-    def error(
-        self,
-        event_type: str,
-        *,
-        meta: Optional[Mapping[str, Any]] = None,
-        **fields: Any,
-    ) -> None:
-        self.event(event_type, meta=meta, level="ERROR", **fields)
-
-    # ---------------------------------------------------------------------
-    # Backward compatible API (older code paths)
-    # ---------------------------------------------------------------------
-    def write(self, record_type: str, payload: Mapping[str, Any]) -> None:
-        """
-        Back-compat: older code wrote {type,data}.
-        We map it to event(meta=payload).
-        """
-        self.event(record_type, meta=dict(payload))
-
-    def write_many(self, record_type: str, items: Iterable[Mapping[str, Any]]) -> None:
-        for item in items:
-            self.write(record_type, item)
+    @property
+    def path(self) -> Path:
+        # Convenience alias used by some call sites
+        return self.events_path
