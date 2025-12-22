@@ -111,3 +111,8 @@ def disable_kill_switch(override: Optional[Union[str, Path]] = None) -> None:
     except Exception:
         # Do not raise; disable should be best-effort.
         pass
+
+
+# Backwards-compatible alias for older callers (ats.run runtime)
+def kill_switch_status(override=None):
+    return read_kill_switch_status(override)

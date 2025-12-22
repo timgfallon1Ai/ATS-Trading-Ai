@@ -1,128 +1,114 @@
 from __future__ import annotations
 
 import json
-import traceback
+import os
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 
 def _utc_now_iso() -> str:
+    # Always UTC, always timezone-aware
     return datetime.now(timezone.utc).isoformat()
 
 
-def default_run_id() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{stamp}-{uuid.uuid4().hex[:8]}"
-
-
-@dataclass(frozen=True)
-class LogPaths:
-    base_dir: Path
-    run_dir: Path
-    events_file: Path
+def _default_run_id() -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{ts}-{uuid.uuid4().hex[:8]}"
 
 
 class LogWriter:
-    """Structured JSONL logger used by ats.run.
+    """
+    Unified ATS JSONL logger.
 
-    Record shape:
-        {
-          "ts": "...",
-          "run_id": "...",
-          "seq": 1,
-          "level": "info" | "error" | "debug",
-          "event": "session_start" | ...,
-          "data": { ... }
-        }
+    Design goals:
+    - Create run-scoped log directory: <log_dir>/<run_id>/events.jsonl
+    - Provide a modern `.event(...)` API used by ats.run runtime orchestration
+    - Keep backward compatibility with older `.write(...)` / `.write_many(...)` usage
+    - Be resilient if `log_dir` is accidentally a FILE (rename out of the way)
     """
 
-    def __init__(
-        self,
-        log_dir: str | Path = "logs",
-        run_id: Optional[str] = None,
-        filename: str = "events.jsonl",
-    ) -> None:
+    def __init__(self, log_dir: str | Path = "logs", run_id: Optional[str] = None):
         base = Path(log_dir)
 
-        # If a file named "logs" exists (historic repo artifact), avoid crashing.
+        # If someone accidentally created "logs" as a FILE, move it aside so we can mkdir.
         if base.exists() and base.is_file():
-            base = base.with_name(base.name + "_dir")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = base.with_name(f"{base.name}.file.{ts}")
+            base.rename(backup)
 
         base.mkdir(parents=True, exist_ok=True)
 
-        self._run_id = run_id or default_run_id()
-        run_dir = base / self._run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        # Prefer explicit run_id, then env override, then generated.
+        resolved_run_id = run_id or os.getenv("ATS_RUN_ID") or _default_run_id()
 
-        self._paths = LogPaths(
-            base_dir=base,
-            run_dir=run_dir,
-            events_file=run_dir / filename,
-        )
-        self._seq = 0
+        self.base_dir: Path = base
+        self.run_id: str = resolved_run_id
+        self.run_dir: Path = self.base_dir / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
 
-    @property
-    def run_id(self) -> str:
-        return self._run_id
+        self.events_path: Path = self.run_dir / "events.jsonl"
 
     @property
-    def paths(self) -> LogPaths:
-        return self._paths
+    def path(self) -> Path:
+        """Back-compat alias used by some callers."""
+        return self.events_path
 
-    def emit(
+    def _append(self, entry: Mapping[str, Any]) -> None:
+        # Ensure directory exists even if someone deleted it mid-run.
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.events_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(entry), ensure_ascii=False) + "\n")
+
+    # ---------------------------------------------------------------------
+    # New API (used by ats.run runtime)
+    # ---------------------------------------------------------------------
+    def event(
         self,
-        event: str,
-        data: Dict[str, Any] | None = None,
-        level: str = "info",
+        event_type: str,
+        *,
+        meta: Optional[Mapping[str, Any]] = None,
+        level: str = "INFO",
+        **fields: Any,
     ) -> None:
-        self._seq += 1
-        payload = {
+        """
+        Write a structured event.
+
+        Example:
+            log.event("session_status", meta={"kill_switch": {...}})
+        """
+        entry: Dict[str, Any] = {
             "ts": _utc_now_iso(),
-            "run_id": self._run_id,
-            "seq": self._seq,
+            "run_id": self.run_id,
+            "type": event_type,
             "level": level,
-            "event": event,
-            "data": data or {},
+            "meta": dict(meta) if meta else {},
         }
+        if fields:
+            entry.update(fields)
 
-        with self._paths.events_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._append(entry)
+
+    def error(
+        self,
+        event_type: str,
+        *,
+        meta: Optional[Mapping[str, Any]] = None,
+        **fields: Any,
+    ) -> None:
+        self.event(event_type, meta=meta, level="ERROR", **fields)
 
     # ---------------------------------------------------------------------
-    # Backwards-compatible API (older code uses `write` and `write_many`)
+    # Backward compatible API (older code paths)
     # ---------------------------------------------------------------------
-    def write(self, record_type: str, payload: Dict[str, Any]) -> None:
-        self.emit(event=record_type, data=payload, level="info")
+    def write(self, record_type: str, payload: Mapping[str, Any]) -> None:
+        """
+        Back-compat: older code wrote {type,data}.
+        We map it to event(meta=payload).
+        """
+        self.event(record_type, meta=dict(payload))
 
-    def write_many(self, record_type: str, items: list[Dict[str, Any]]) -> None:
+    def write_many(self, record_type: str, items: Iterable[Mapping[str, Any]]) -> None:
         for item in items:
             self.write(record_type, item)
-
-    def exception(
-        self,
-        event: str,
-        data: Dict[str, Any] | None = None,
-        exc: BaseException | None = None,
-    ) -> None:
-        """Emit an error event including exception metadata."""
-        if exc is None:
-            tb = traceback.format_exc()
-            exc_type = None
-            exc_msg = None
-        else:
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            exc_type = type(exc).__name__
-            exc_msg = str(exc)
-
-        merged = dict(data or {})
-        merged.update(
-            {
-                "exc_type": exc_type,
-                "exc_msg": exc_msg,
-                "traceback": tb,
-            }
-        )
-        self.emit(event=event, data=merged, level="error")
