@@ -1,78 +1,88 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional
+
+from ats.backtester2.artifacts import write_backtest_artifacts
+from ats.backtester2.run import run_backtest as bt2_run_backtest
+from ats.orchestrator.log_writer import LogWriter
 
 
-class Orchestrator:
-    """The unified trading orchestrator:
-    - Runs the ingestion layer
-    - Feeds analyst
-    - Feeds risk manager
-    - Feeds aggregator
-    - Sends intents to trader
-    - Sends results to dashboard
-    - Maintains posture/state
+def create_run_id(prefix: str = "run") -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}-{ts}-{uuid.uuid4().hex[:8]}"
+
+
+@dataclass
+class BacktestRunConfig:
+    symbol: str
+    days: int = 50
+    strategy: str = "ma"
+    enable_risk: bool = True
+    strategy_names: Optional[List[str]] = None
+    max_position_frac: float = 0.20
+    csv: Optional[str] = None
+    log_dir: Path = Path("logs")
+    run_id: Optional[str] = None
+
+
+class RuntimeOrchestrator:
+    """
+    Runtime orchestrator for `python -m ats.run backtest`.
+
+    Responsibilities required by Phase 14:
+      - create run dir + events.jsonl
+      - execute backtest
+      - write artifacts into run dir:
+          equity_curve.csv, trades.csv, metrics.json
     """
 
-    def __init__(self, registry):
-        self.reg = registry
+    def __init__(
+        self, log_dir: Path = Path("logs"), run_id: Optional[str] = None
+    ) -> None:
+        self.log_dir = Path(log_dir)
+        self.run_id = run_id
+        self.log: Optional[LogWriter] = None
 
-    # -----------------------------------------------------------
-    # ONE COMPLETE SYSTEM TICK
-    # -----------------------------------------------------------
-    def step(self):
+    def run_backtest(self, cfg: BacktestRunConfig):
+        run_id = cfg.run_id or self.run_id or create_run_id("backtest")
+        cfg.run_id = run_id
 
-        # ----------------------------
-        # 1) INGEST AND MERGE BARS
-        # ----------------------------
-        ubf = self.reg["ubf"]
-        merged_bars = ubf.fetch()  # {sym: merged_bar_dict}
+        log = LogWriter(log_dir=cfg.log_dir, run_id=run_id)
+        self.log = log
 
-        # ----------------------------
-        # 2) ANALYST SIGNALS
-        # ----------------------------
-        analyst = self.reg["analyst"]
-        signals_by_symbol: Dict[str, Any] = {}
-        for sym, bar in merged_bars.items():
-            signals_by_symbol[sym] = analyst.generate(bar)
-
-        # ----------------------------
-        # 3) RISK MANAGER
-        # ----------------------------
-        rm = self.reg["risk"]
-        risk_filtered = rm.apply(signals_by_symbol)
-
-        # ----------------------------
-        # 4) AGGREGATOR
-        # ----------------------------
-        agg = self.reg["aggregator"]
-        intents = agg.process_batch(merged_bars, risk_filtered)
-
-        # ----------------------------
-        # 5) TRADER EXECUTION
-        # ----------------------------
-        trader = self.reg["trader"]
-        trader.execute_intents(intents, merged_bars)
-
-        # ----------------------------
-        # 6) EQUITY / POSTURE UPDATE
-        # ----------------------------
-        posture = self.reg["posture"]
-        equity = self.reg["equity"]
-
-        latest_prices = {s: merged_bars[s]["close"] for s in merged_bars}
-        equity_value = equity.total(latest_prices)
-        posture.update_equity(equity_value)
-
-        # ----------------------------
-        # 7) DASHBOARD FEED
-        # ----------------------------
-        dashboard = self.reg["dashboard"]
-        dashboard.push(
-            {
-                "equity": equity_value,
-                "posture": posture.state,
-                "positions": trader.book.positions,
-                "last_intents": intents,
-            }
+        log.event(
+            "run_start",
+            meta={
+                "kind": "backtest",
+                "run_id": run_id,
+                "symbol": cfg.symbol,
+                "days": cfg.days,
+                "strategy": cfg.strategy,
+                "enable_risk": cfg.enable_risk,
+            },
         )
+
+        result = bt2_run_backtest(
+            symbol=cfg.symbol,
+            days=cfg.days,
+            enable_risk=cfg.enable_risk,
+            strategy=cfg.strategy,
+            strategy_names=cfg.strategy_names,
+            max_position_frac=cfg.max_position_frac,
+            csv=cfg.csv,
+        )
+
+        # Write required run artifacts into the SAME run directory as events.jsonl
+        paths = write_backtest_artifacts(
+            portfolio_history=getattr(result, "portfolio_history", []) or [],
+            trade_history=getattr(result, "trade_history", []) or [],
+            out_dir=log.path,
+        )
+
+        log.event("artifacts_written", meta={"paths": [str(p) for p in paths]})
+        log.event("run_end", meta={"run_id": run_id})
+        return result

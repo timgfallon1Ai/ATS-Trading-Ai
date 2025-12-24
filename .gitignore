@@ -1,22 +1,45 @@
-/.venv
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+.venv/
 venv/
 __pycache__/
+*.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.pyc
 dist/
 build/
 *.egg-info/
 
-# Local environment file with secrets (do not commit)
-.env
+# ------------------------------------------------------------
+# OS / editor
+# ------------------------------------------------------------
+.DS_Store
 
-# Generated diagnostics and reports
-pyright_report.json
-logs/diagnostics/*
-repo_untracked.txt
+# ------------------------------------------------------------
+# Env / secrets
+# ------------------------------------------------------------
+.env
 ats/config/keys.yaml
-logs/
-logs/
+ats/config/keys.yml
 keys.yaml
+keys.yml
+
+# ------------------------------------------------------------
+# Logs / artifacts
+# ------------------------------------------------------------
+logs/
+logs
+*.log
+*.jsonl
+analyst_logs/
+ats/analyst.zip
+
+# ------------------------------------------------------------
+# Reports / diagnostics
+# ------------------------------------------------------------
+pyright_report.json
+
+# Local backup zips
+ats/*.zip

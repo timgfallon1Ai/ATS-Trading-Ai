@@ -30,7 +30,7 @@ def _compute_symbol_weights(
         if w <= 0.0:
             continue
 
-        weights[symbol] = weights.get(symbol, 0.0) + w
+        weights[symbol] = weights.get(symbol, 0.0) + float(w)
 
     if not weights:
         symbols: Set[str] = {a["symbol"] for a in allocations}
@@ -53,11 +53,11 @@ def allocations_to_capital_packets(
     allocations: List[AggregatedAllocation],
     base_capital: float = DEFAULT_BASE_CAPITAL,
 ) -> List[CapitalAllocPacket]:
-    """Convert normalized AggregatedAllocation entries into RM3-friendly packets.
+    """Convert AggregatedAllocation entries into RM3-style capital packets.
 
-    This is the main bridge RM3/RM4 should consume. It takes the output of
-    Aggregator.prepare_batch(...)[\"allocations\"] (or equivalent) and produces
-    per-symbol capital allocations plus strategy breakdown metadata.
+    Output contract:
+      - target_dollars is signed (score direction preserved).
+      - capital is also included as a deprecated alias for backward compatibility.
     """
     symbol_weights = _compute_symbol_weights(allocations)
     if not symbol_weights:
@@ -70,17 +70,20 @@ def allocations_to_capital_packets(
         if symbol not in symbol_weights:
             continue
 
-        weight = symbol_weights[symbol]
-        capital = base_capital * weight
+        weight = float(symbol_weights[symbol])
+        direction = 1.0 if float(alloc["score"]) >= 0.0 else -1.0
+        target_dollars = float(base_capital) * weight * direction
 
         packets.append(
             {
                 "symbol": symbol,
-                "capital": capital,
+                "target_dollars": target_dollars,
+                "capital": target_dollars,  # deprecated alias
                 "score": float(alloc["score"]),
                 "confidence": float(alloc["confidence"]),
                 "strategy_breakdown": dict(alloc.get("strategy_breakdown") or {}),
                 "metadata": dict(alloc.get("metadata") or {}),
+                "timestamp": str(alloc.get("timestamp") or ""),
             }
         )
 
@@ -93,9 +96,9 @@ def batch_to_capital_packets(
 ) -> List[CapitalAllocPacket]:
     """Convenience: take the full Aggregator.prepare_batch(...) result.
 
-    Expects a dict with an `allocations` key containing AggregatedAllocation
-    entries. This keeps the Risk Manager side decoupled from the exact batch
-    structure Aggregator uses.
+    Expects a dict with an `allocations` key containing AggregatedAllocation entries.
+    This keeps the Risk Manager side decoupled from the exact batch structure
+    Aggregator uses.
     """
     allocations: List[AggregatedAllocation] = batch.get("allocations", [])
     return allocations_to_capital_packets(

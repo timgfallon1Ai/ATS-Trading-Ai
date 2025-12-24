@@ -1,47 +1,39 @@
 from __future__ import annotations
+
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Optional
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class LogWriter:
     """
-    Unified ATS logging layer.
-    Writes governance events, risk packets, and trader fills to rotating JSONL files.
+    Simple JSONL event logger.
+
+    Creates:
+      <log_dir>/<run_id>/events.jsonl
     """
 
-    def __init__(self, log_dir: str = "logs"):
+    def __init__(self, log_dir: Path, run_id: str) -> None:
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.run_id = str(run_id)
 
-    # ------------------------------------------------------------
-    def _file(self) -> Path:
-        """Daily log file."""
-        date = datetime.utcnow().strftime("%Y-%m-%d")
-        return self.log_dir / f"{date}.jsonl"
+        # Run directory
+        self.path = self.log_dir / self.run_id
+        self.path.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------
-    def write(self, record_type: str, payload: Dict[str, Any]):
-        """
-        Writes a single log line:
-        {
-            "ts": "...",
-            "type": "governance" | "risk" | "trade",
-            "data": { ... }
-        }
-        """
-        entry = {
-            "ts": datetime.utcnow().isoformat(),
-            "type": record_type,
-            "data": payload,
-        }
+        # Events file
+        self.events_path = self.path / "events.jsonl"
+        self.events_path.touch(exist_ok=True)
 
-        with self._file().open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+    def event(self, name: str, meta: Optional[Dict[str, Any]] = None) -> None:
+        record: Dict[str, Any] = {"ts": _utc_now_iso(), "event": str(name)}
+        if meta is not None:
+            record["meta"] = meta
 
-    # ------------------------------------------------------------
-    def write_many(self, record_type: str, items: List[Dict[str, Any]]):
-        """Write multiple events at once."""
-        for item in items:
-            self.write(record_type, item)
+        with self.events_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")

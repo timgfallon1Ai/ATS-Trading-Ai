@@ -1,11 +1,13 @@
-from .boot import boot_system
-from .orchestrator import Orchestrator
-from .service_registry import ServiceRegistry
-from .system_clock import SystemClock
+"""ats.run
+
+Unified runtime entrypoint.
+
+Keep __init__ intentionally light to avoid circular import issues.
+"""
+
+from ats.run.boot import BootConfig, boot_system
 
 __all__ = [
-    "SystemClock",
-    "ServiceRegistry",
-    "Orchestrator",
+    "BootConfig",
     "boot_system",
 ]

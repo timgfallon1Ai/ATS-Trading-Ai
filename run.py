@@ -1,13 +1,7 @@
-from ats.orchestrator import ATSOrchestrator
+from __future__ import annotations
+
+from ats.run.__main__ import main
+
 
 if __name__ == "__main__":
-    universe = ["AAPL", "MSFT", "TSLA", "NVDA"]
-
-    ats = ATSOrchestrator(starting_capital=1000.0)
-
-    result = ats.run_cycle(universe)
-
-    print("\n=== ATS CYCLE COMPLETE ===")
-    print("Timestamp:", result["timestamp"])
-    print("Portfolio:", result["trader"]["portfolio"])
-    print("Fills:", result["trader"]["fills"])
+    raise SystemExit(main())
