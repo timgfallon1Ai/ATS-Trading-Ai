@@ -27,3 +27,23 @@ def run_backtest(
 if __name__ == "__main__":
     # Example placeholder
     print("Backtester runner is not invoked directly — use run_backtest().")
+
+log_path = (
+    getattr(self.log, "path", None)
+    or getattr(self.log, "events_path", None)
+    or getattr(self.log, "log_dir", None)
+)
+run_dir = Path(log_path) if log_path is not None else Path("logs")
+if run_dir.suffix:  # events.jsonl
+    run_dir = run_dir.parent
+
+artifact_paths = write_backtest_artifacts(
+    portfolio_history=res.portfolio_history or [],
+    trade_history=res.trade_history or [],
+    out_dir=run_dir,
+)
+
+self.log.event(
+    "artifacts_written",
+    meta={"paths": [str(p) for p in artifact_paths]},
+)

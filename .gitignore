@@ -40,3 +40,6 @@ ats/analyst.zip
 # Reports / diagnostics
 # ------------------------------------------------------------
 pyright_report.json
+
+# Local backup zips
+ats/*.zip
