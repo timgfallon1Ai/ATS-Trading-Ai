@@ -1,386 +1,424 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from ats.backtester2.backtest_config import BacktestConfig
-from ats.backtester2.types import Bar
-
-try:
-    # Newer location (added in phase14)
-    from ats.trader.order import Order
-except Exception:  # pragma: no cover
-    # Older location
-    from ats.trader.order_types import Order  # type: ignore
-
+from ats.risk_manager.risk_manager import RiskDecision, RiskManager
+from ats.trader.order_types import Order
 from ats.trader.trader import Trader
 
-try:
-    # Prefer backtester2 wrapper if present (tests may import this).
-    from ats.backtester2.kill_switch import (  # type: ignore
-        kill_switch_engaged,
-        read_kill_switch_state,
-    )
-except Exception:  # pragma: no cover
-    try:
-        # Fallback to core kill-switch implementation.
-        from ats.core.kill_switch import (  # type: ignore
-            kill_switch_engaged,
-            read_kill_switch_state,
-        )
-    except Exception:  # pragma: no cover
-
-        def kill_switch_engaged() -> bool:  # type: ignore
-            return False
-
-        def read_kill_switch_state() -> Any:  # type: ignore
-            return None
-
-
-try:
-    from ats.risk_manager.risk_manager import RiskManager
-except Exception:  # pragma: no cover
-    RiskManager = Any  # type: ignore[misc,assignment]
-
+from .backtest_config import BacktestConfig
+from .types import Bar
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class BacktestResult:
-    """
-    Backtest output container.
-
-    Tests require:
-      - `res.config.symbol` to exist
-      - `portfolio_history` to record per bar (unless halted early)
-    """
-
     config: BacktestConfig
     portfolio_history: List[Dict[str, Any]] = field(default_factory=list)
-    trade_history: List[Dict[str, Any]] = field(default_factory=list)
+    trade_history: List[Any] = field(default_factory=list)
     final_portfolio: Optional[Dict[str, Any]] = None
     risk_decisions: List[Any] = field(default_factory=list)
 
-    # Optional metadata
-    halted: bool = False
-    halted_reason: Optional[str] = None
 
-    @property
-    def symbol(self) -> str:
-        return str(getattr(self.config, "symbol", ""))
-
-
-@dataclass
 class BacktestEngine:
-    config: BacktestConfig
-    trader: Trader
-    bars: Sequence[Bar]
-    strategy: Any
-    risk_manager: Optional[RiskManager] = None
+    def __init__(
+        self,
+        config: BacktestConfig,
+        trader: Trader,
+        bars: Sequence[Bar],
+        strategy: Any,
+        risk_manager: Optional[RiskManager] = None,
+    ) -> None:
+        self.config = config
+        self.trader = trader
+        self.strategy = strategy
+        self.risk_manager = risk_manager
+        self._bars = list(bars)
 
-    # ----- helpers -----
+    # ---------------------------
+    # Kill-switch helpers
+    # ---------------------------
+
+    def _kill_switch_path(self) -> Optional[Path]:
+        """
+        Prefer ATS_KILL_SWITCH_FILE when set (unit tests set this).
+        Fallback (best-effort) to ATS_LOG_DIR/KILL_SWITCH for CLI parity.
+        """
+        raw = os.getenv("ATS_KILL_SWITCH_FILE")
+        if raw:
+            try:
+                return Path(raw)
+            except Exception:
+                return None
+
+        log_dir = os.getenv("ATS_LOG_DIR")
+        if log_dir:
+            try:
+                return Path(log_dir) / "KILL_SWITCH"
+            except Exception:
+                return None
+
+        return None
+
+    def _is_kill_switch_engaged(self) -> bool:
+        """
+        Engage if the kill switch file exists.
+        """
+        # Prefer the backtester2 module if present (keeps semantics aligned with tests),
+        # but never fail hard if it can't be imported.
+        try:
+            from .kill_switch import is_kill_switch_engaged  # type: ignore
+
+            return bool(is_kill_switch_engaged())
+        except Exception:
+            pass
+
+        p = self._kill_switch_path()
+        if not p:
+            return False
+        try:
+            return p.exists()
+        except Exception:
+            return False
+
+    # ---------------------------
+    # Market / portfolio snapshots
+    # ---------------------------
 
     def _market_snapshot(self, bar: Bar) -> Dict[str, float]:
-        """
-        Return a mapping {symbol: price} for mark-to-market. Prefer Trader.market.snapshot()
-        if present; otherwise derive from the bar.
-        """
-        sym = str(getattr(bar, "symbol", getattr(self.config, "symbol", "")))
-        px = float(getattr(bar, "close", getattr(bar, "price", 0.0)) or 0.0)
-
-        market = getattr(self.trader, "market", None)
-        snap = getattr(market, "snapshot", None)
-        if callable(snap):
+        mkt = getattr(self.trader, "market", None)
+        snap_fn = getattr(mkt, "snapshot", None)
+        if callable(snap_fn):
             try:
-                out = snap()
-                if isinstance(out, dict):
-                    return {str(k): float(v) for k, v in out.items()}
-            except Exception:  # pragma: no cover
-                logger.exception("Market.snapshot() failed; falling back to bar price")
+                v = snap_fn()
+                if isinstance(v, dict):
+                    out: Dict[str, float] = {}
+                    for k, vv in v.items():
+                        try:
+                            out[str(k)] = float(vv)
+                        except Exception:
+                            continue
+                    if out:
+                        return out
+            except Exception:
+                pass
 
-        return {sym: px}
+        # Fallback: bar close
+        try:
+            return {str(bar.symbol): float(bar.close)}
+        except Exception:
+            return {}
 
     def _portfolio_snapshot(self, prices: Dict[str, float]) -> Dict[str, Any]:
-        """
-        Return a dict portfolio snapshot. Some implementations require prices as a param.
-        """
         portfolio = getattr(self.trader, "portfolio", None)
-        snap = getattr(portfolio, "snapshot", None)
-        if callable(snap):
+        snap_fn = getattr(portfolio, "snapshot", None)
+        if callable(snap_fn):
             try:
-                return dict(snap(prices))  # type: ignore[arg-type]
+                v = snap_fn(prices)
+                if isinstance(v, dict):
+                    return dict(v)
             except TypeError:
-                # Older signature
-                return dict(snap())  # type: ignore[misc]
-            except Exception:  # pragma: no cover
-                logger.exception(
-                    "Portfolio.snapshot() failed; returning empty snapshot"
-                )
+                # Some older snapshot() signatures may not accept prices
+                try:
+                    v2 = snap_fn()
+                    if isinstance(v2, dict):
+                        return dict(v2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
+        # Best-effort fallback: empty snapshot
         return {}
 
-    def _evaluate_orders_with_risk(
-        self, bar: Bar, candidate: Sequence[Order]
-    ) -> Tuple[List[Order], Optional[Any]]:
-        """Run risk manager if present; otherwise return candidate."""
-        if not candidate or self.risk_manager is None:
-            return list(candidate), None
+    # ---------------------------
+    # Order coercion / strategy
+    # ---------------------------
 
-        rm = self.risk_manager
-        decision = None
+    def _coerce_order(self, obj: Any) -> Optional[Order]:
+        if obj is None:
+            return None
+        if isinstance(obj, Order):
+            return obj
 
-        # Try common method names; support both old and new signatures.
-        for name in ("evaluate_orders", "evaluate", "filter_orders"):
-            fn = getattr(rm, name, None)
-            if not callable(fn):
-                continue
+        # dict-like
+        if isinstance(obj, dict):
             try:
-                decision = fn(list(candidate), bar=bar, trader=self.trader)  # type: ignore[misc]
-                break
-            except TypeError:
-                try:
-                    decision = fn(list(candidate))  # type: ignore[misc]
-                    break
-                except Exception:  # pragma: no cover
-                    logger.exception("RiskManager.%s failed", name)
-                    decision = None
-                    break
-            except Exception:  # pragma: no cover
-                logger.exception("RiskManager.%s failed", name)
-                decision = None
-                break
+                symbol = str(obj.get("symbol"))
+                side = str(obj.get("side"))
+                size_raw = obj.get("size", obj.get("qty", obj.get("quantity", 0.0)))
+                size = float(size_raw)
+                order_type = str(obj.get("order_type", "market"))
+                return Order(symbol=symbol, side=side, size=size, order_type=order_type)
+            except Exception:
+                return None
 
-        if decision is None:
-            return list(candidate), None
-
-        # Accept either an iterable of orders, a dict with "accepted_orders", or a custom object.
-        accepted: List[Order] = []
-        if isinstance(decision, dict):
-            maybe = decision.get("accepted_orders", decision.get("orders"))
-            if maybe is None:
-                accepted = list(candidate)
-            elif isinstance(maybe, list):
-                accepted = [o for o in maybe if o]
-            else:
-                try:
-                    accepted = list(maybe)  # type: ignore[arg-type]
-                except Exception:
-                    accepted = list(candidate)
-        else:
-            maybe = getattr(decision, "accepted_orders", None)
-            if maybe is None:
-                accepted = list(candidate)
-            elif isinstance(maybe, list):
-                accepted = [o for o in maybe if o]
-            else:
-                try:
-                    accepted = list(maybe)  # type: ignore[arg-type]
-                except Exception:
-                    accepted = list(candidate)
-
-        return accepted, decision
-
-    def _process_orders(self, orders: Sequence[Order], bar: Bar) -> Any:
-        """Send orders to Trader, handling old/new signatures."""
-        ts = getattr(bar, "timestamp", None)
+        # attribute-like
         try:
-            return self.trader.process_orders(list(orders), timestamp=ts)  # type: ignore[arg-type]
-        except TypeError:
-            return self.trader.process_orders(list(orders))  # type: ignore[arg-type]
+            symbol = getattr(obj, "symbol", None)
+            side = getattr(obj, "side", None)
+            size_raw = getattr(obj, "size", None)
+            if size_raw is None:
+                size_raw = getattr(obj, "qty", None)
+            if size_raw is None:
+                size_raw = getattr(obj, "quantity", None)
+            order_type = getattr(obj, "order_type", "market")
 
-    def _append_from_trader_result(
-        self,
-        result: Any,
-        bar: Bar,
-        prices: Dict[str, float],
-        portfolio_history: List[Dict[str, Any]],
-        trade_history: List[Dict[str, Any]],
-        last_ledger_len: int,
-    ) -> int:
-        """Normalize trader output to portfolio_history + trade_history; returns updated ledger index."""
-        # Portfolio snapshot (always)
-        port_entry: Dict[str, Any] = {}
-        if isinstance(result, dict):
-            port = result.get("portfolio")
-            if isinstance(port, dict):
-                port_entry = dict(port)
+            if symbol is None or side is None or size_raw is None:
+                return None
+
+            return Order(
+                symbol=str(symbol),
+                side=str(side),
+                size=float(size_raw),
+                order_type=str(order_type),
+            )
+        except Exception:
+            return None
+
+    def _strategy_orders(self, bar: Bar) -> List[Order]:
+        out: Any = None
+        try:
+            strategy_fn = getattr(self.strategy, "on_bar", None)
+            if callable(strategy_fn):
+                out = strategy_fn(bar, self.trader)
             else:
-                port_entry = dict(self._portfolio_snapshot(prices))
-        else:
-            port_entry = dict(self._portfolio_snapshot(prices))
-
-        if "timestamp" not in port_entry:
-            port_entry["timestamp"] = getattr(bar, "timestamp", None)
-        portfolio_history.append(port_entry)
-
-        # Trades/fills
-        if isinstance(result, dict):
-            fills = result.get("fills")
-            if isinstance(fills, list) and fills:
-                for f in fills:
-                    trade_history.append(f if isinstance(f, dict) else {"fill": f})
-                return last_ledger_len
-
-            ledger = result.get("trade_history")
-            if isinstance(ledger, list):
-                new = ledger[last_ledger_len:]
-                for t in new:
-                    trade_history.append(t if isinstance(t, dict) else {"trade": t})
-                return len(ledger)
-
-        return last_ledger_len
-
-    def _build_flatten_orders(self, prices: Dict[str, float]) -> List[Order]:
-        """Build market orders that flatten all open positions."""
-        snap = self._portfolio_snapshot(prices)
-        positions = snap.get("positions", {}) if isinstance(snap, dict) else {}
-        if not isinstance(positions, dict):
+                # Strategy may be a plain callable(bar, trader)
+                out = self.strategy(bar, self.trader)
+        except Exception:
+            logger.exception("Strategy evaluation failed; skipping bar.")
             return []
 
-        orders: List[Order] = []
-        for sym, pos in positions.items():
-            qty = 0.0
-            if isinstance(pos, dict):
-                qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
-            else:
-                try:
-                    qty = float(
-                        getattr(pos, "quantity", getattr(pos, "qty", 0.0)) or 0.0
-                    )
-                except Exception:
-                    qty = 0.0
+        if out is None:
+            return []
 
+        if isinstance(out, list):
+            orders: List[Order] = []
+            for item in out:
+                o = self._coerce_order(item)
+                if o is not None:
+                    orders.append(o)
+            return orders
+
+        single = self._coerce_order(out)
+        return [single] if single is not None else []
+
+    # ---------------------------
+    # Risk + execution
+    # ---------------------------
+
+    def _evaluate_orders_with_risk(
+        self, orders: List[Order], prices: Dict[str, float], bar: Bar
+    ) -> Tuple[List[Order], Optional[RiskDecision]]:
+        if not self.risk_manager or not orders:
+            return orders, None
+
+        ctx = {
+            "prices": prices,
+            "bar": bar,
+            "portfolio": self._portfolio_snapshot(prices),
+        }
+
+        try:
+            decision = self.risk_manager.evaluate_orders(orders, ctx)
+        except Exception:
+            logger.exception(
+                "RiskManager.evaluate_orders failed; passing orders through."
+            )
+            return orders, None
+
+        # Accept both dict-based and object-based decisions
+        accepted = None
+        if isinstance(decision, dict):
+            accepted = decision.get("accepted_orders", None)
+        else:
+            accepted = getattr(decision, "accepted_orders", None)
+
+        safe: List[Order] = []
+        if isinstance(accepted, list):
+            for item in accepted:
+                o = self._coerce_order(item)
+                if o is not None:
+                    safe.append(o)
+
+        # If decision doesn't provide accepted_orders, treat as pass-through
+        if not safe and accepted is None:
+            safe = orders
+
+        return safe, decision
+
+    def _safe_update_market(self, prices: Dict[str, float], bar: Bar) -> None:
+        update_market = getattr(self.trader, "update_market", None)
+        if not callable(update_market):
+            return
+        try:
+            update_market(prices, timestamp=getattr(bar, "timestamp", None))
+        except TypeError:
+            # older signature
+            try:
+                update_market(prices)
+            except Exception:
+                logger.exception("Trader.update_market failed (fallback).")
+        except Exception:
+            logger.exception("Trader.update_market failed.")
+
+    def _process_orders(self, orders: List[Order], bar: Bar) -> Dict[str, Any]:
+        process_orders = getattr(self.trader, "process_orders", None)
+        if not callable(process_orders):
+            return {
+                "portfolio": self._portfolio_snapshot(self._market_snapshot(bar)),
+                "fills": [],
+            }
+
+        try:
+            result = process_orders(orders, timestamp=getattr(bar, "timestamp", None))
+            return result if isinstance(result, dict) else {"result": result}
+        except TypeError:
+            # older signature
+            try:
+                result = process_orders(orders)
+                return result if isinstance(result, dict) else {"result": result}
+            except Exception:
+                logger.exception("Trader.process_orders failed (fallback).")
+                return {
+                    "portfolio": self._portfolio_snapshot(self._market_snapshot(bar)),
+                    "fills": [],
+                }
+        except Exception:
+            logger.exception("Trader.process_orders failed.")
+            return {
+                "portfolio": self._portfolio_snapshot(self._market_snapshot(bar)),
+                "fills": [],
+            }
+
+    # ---------------------------
+    # Flatten logic (kill-switch)
+    # ---------------------------
+
+    def _extract_position_quantities(
+        self, portfolio_snap: Dict[str, Any]
+    ) -> Dict[str, float]:
+        pos = portfolio_snap.get("positions", None)
+        out: Dict[str, float] = {}
+
+        if isinstance(pos, dict):
+            for sym, v in pos.items():
+                qty_val: Any = None
+                if isinstance(v, dict):
+                    qty_val = v.get("quantity", v.get("qty", v.get("position")))
+                else:
+                    qty_val = v
+                try:
+                    qty = float(qty_val)
+                except Exception:
+                    continue
+                out[str(sym)] = qty
+
+        return out
+
+    def _build_flatten_orders(self, prices: Dict[str, float]) -> List[Order]:
+        snap = self._portfolio_snapshot(prices)
+        qtys = self._extract_position_quantities(snap)
+
+        orders: List[Order] = []
+        for sym, qty in qtys.items():
             if abs(qty) < 1e-9:
                 continue
-
             side = "sell" if qty > 0 else "buy"
             orders.append(
-                Order(
-                    symbol=str(sym),
-                    side=side,
-                    size=float(abs(qty)),
-                    order_type="market",
-                )
+                Order(symbol=sym, side=side, size=float(abs(qty)), order_type="market")
             )
         return orders
 
-    def _kill_switch_reason(self) -> Optional[str]:
-        try:
-            st = read_kill_switch_state()
-            return (
-                getattr(st, "reason", None)
-                or getattr(st, "message", None)
-                or getattr(st, "detail", None)
-            )
-        except Exception:  # pragma: no cover
-            return None
-
-    # ----- main loop -----
+    # ---------------------------
+    # Main loop
+    # ---------------------------
 
     def run(self) -> BacktestResult:
         portfolio_history: List[Dict[str, Any]] = []
-        trade_history: List[Dict[str, Any]] = []
+        trade_history: List[Any] = []
         risk_decisions: List[Any] = []
 
         last_ledger_len = 0
-        halted = False
-        halted_reason: Optional[str] = None
 
-        for idx, bar in enumerate(self.bars):
-            if self.config.bar_limit is not None and idx >= self.config.bar_limit:
+        for i, bar in enumerate(self._bars):
+            # Respect bar_limit if set
+            bar_limit = getattr(self.config, "bar_limit", None)
+            if bar_limit is not None and i >= int(bar_limit):
                 break
 
-            # Mark-to-market first.
-            self.trader.update_market({str(bar.symbol): float(bar.close)})
-
-            # Kill-switch check: if engaged, flatten and stop BEFORE calling strategy on this bar.
-            if kill_switch_engaged():
-                halted = True
-                halted_reason = self._kill_switch_reason() or "kill_switch"
-
+            # Mark-to-market first
+            prices = self._market_snapshot(bar)
+            if prices:
+                self._safe_update_market(prices, bar)
                 prices = self._market_snapshot(bar)
 
+            # Kill-switch check MUST happen before calling strategy on this bar
+            if self._is_kill_switch_engaged():
                 flatten_orders = self._build_flatten_orders(prices)
-                if flatten_orders:
-                    result = self._process_orders(flatten_orders, bar)
-                    last_ledger_len = self._append_from_trader_result(
-                        result,
-                        bar,
-                        prices,
-                        portfolio_history,
-                        trade_history,
-                        last_ledger_len,
-                    )
-                else:
-                    # No positions to flatten; still record a snapshot for this bar.
-                    last_ledger_len = self._append_from_trader_result(
-                        {},
-                        bar,
-                        prices,
-                        portfolio_history,
-                        trade_history,
-                        last_ledger_len,
-                    )
+                result = self._process_orders(flatten_orders, bar)
 
+                snap = result.get("portfolio")
+                if not isinstance(snap, dict):
+                    snap = self._portfolio_snapshot(prices)
+                snap = dict(snap) if isinstance(snap, dict) else {}
+                if "timestamp" not in snap:
+                    snap["timestamp"] = getattr(bar, "timestamp", None)
+                portfolio_history.append(snap)
+
+                ledger = getattr(self.trader, "ledger", None)
+                if isinstance(ledger, list):
+                    new_items = ledger[last_ledger_len:]
+                    last_ledger_len = len(ledger)
+                    if new_items:
+                        trade_history.extend(new_items)
+
+                fills = result.get("fills")
+                if isinstance(fills, list) and fills:
+                    trade_history.extend(fills)
+
+                # Stop immediately after flattening
                 break
 
-            # Strategy generates candidate orders (can be empty).
-            try:
-                out = self.strategy(bar, self.trader)
-            except Exception:  # pragma: no cover
-                logger.exception("Strategy failed; treating as no-orders")
-                out = []
-
-            candidate_orders: List[Order]
-            if out is None:
-                candidate_orders = []
-            elif isinstance(out, Order):
-                candidate_orders = [out]
-            elif isinstance(out, list):
-                candidate_orders = [o for o in out if o]
-            elif isinstance(out, dict):
-                maybe = out.get("orders") or out.get("accepted_orders")
-                if maybe is None:
-                    candidate_orders = []
-                elif isinstance(maybe, list):
-                    candidate_orders = [o for o in maybe if o]
-                else:
-                    try:
-                        candidate_orders = [o for o in list(maybe) if o]  # type: ignore[arg-type]
-                    except TypeError:
-                        candidate_orders = []
-            else:
-                # If it's an iterator/generator, list() it. If it's a single order-like object, wrap it.
-                try:
-                    candidate_orders = [o for o in list(out) if o]  # type: ignore[arg-type]
-                except TypeError:
-                    candidate_orders = [out]  # type: ignore[list-item]
-
-            # Optional risk layer.
+            # Normal path: strategy -> risk -> execute
+            candidate_orders = self._strategy_orders(bar)
             safe_orders, decision = self._evaluate_orders_with_risk(
-                bar, candidate_orders
+                candidate_orders, prices, bar
             )
             if decision is not None:
                 risk_decisions.append(decision)
 
-            # Always call trader, even if safe_orders is empty, so we snapshot per bar.
             result = self._process_orders(safe_orders, bar)
 
-            prices = self._market_snapshot(bar)
-            last_ledger_len = self._append_from_trader_result(
-                result, bar, prices, portfolio_history, trade_history, last_ledger_len
-            )
+            snap = result.get("portfolio")
+            if not isinstance(snap, dict):
+                snap = self._portfolio_snapshot(prices)
+            snap = dict(snap) if isinstance(snap, dict) else {}
+            if "timestamp" not in snap:
+                snap["timestamp"] = getattr(bar, "timestamp", None)
+            portfolio_history.append(snap)
+
+            ledger = getattr(self.trader, "ledger", None)
+            if isinstance(ledger, list):
+                new_items = ledger[last_ledger_len:]
+                last_ledger_len = len(ledger)
+                if new_items:
+                    trade_history.extend(new_items)
+
+            fills = result.get("fills")
+            if isinstance(fills, list) and fills:
+                trade_history.extend(fills)
 
         final_portfolio = portfolio_history[-1] if portfolio_history else None
-
         return BacktestResult(
             config=self.config,
             portfolio_history=portfolio_history,
             trade_history=trade_history,
             final_portfolio=final_portfolio,
             risk_decisions=risk_decisions,
-            halted=halted,
-            halted_reason=halted_reason,
         )

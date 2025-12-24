@@ -1,18 +1,59 @@
+cat > ats / backtester2 / schema.py << "PY"
 from __future__ import annotations
 
-"""
-ats.backtester2.schema
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-Compatibility shim.
 
-Some earlier modules referenced `ats.backtester2.schema` for Bar/Order.
-Backtester2 now defines Bar in `ats.backtester2.types` and Order in
-`ats.trader.order_types`.
+@dataclass(frozen=True)
+class Bar:
+    """Simple OHLCV bar used by Backtester2 tests and engine."""
 
-This module exists purely to avoid ModuleNotFoundError in older imports.
-"""
+    timestamp: str
+    symbol: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
-from ats.trader.order_types import Order
-from .types import Bar
 
-__all__ = ["Bar", "Order"]
+@dataclass
+class BacktestConfig:
+    """
+    Minimal backtest configuration for Backtester2.
+
+    Tests rely on these fields existing:
+    - symbol
+    - starting_capital
+    - bar_limit
+    """
+
+    symbol: str
+    starting_capital: float = 100_000.0
+    bar_limit: Optional[int] = None
+
+    # Optional metadata (safe / backwards-compatible)
+    strategy: str = "ma"
+    days: Optional[int] = None
+    enable_risk: bool = True
+
+
+@dataclass
+class BacktestResult:
+    """
+    Result container returned by Backtester2.
+
+    Tests rely on:
+    - .config
+    - .portfolio_history
+    - .final_portfolio
+    """
+
+    config: BacktestConfig
+    portfolio_history: List[Dict[str, Any]] = field(default_factory=list)
+    trade_history: List[Dict[str, Any]] = field(default_factory=list)
+    final_portfolio: Optional[Dict[str, Any]] = None
+
+
+PY
