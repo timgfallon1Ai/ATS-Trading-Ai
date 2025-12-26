@@ -1,4 +1,4 @@
-.PHONY: build up up-detach logs test lint clean backtest2
+.PHONY: build up up-detach logs test lint clean backtest2 install-rg
 
 build:
 	docker compose build
@@ -23,3 +23,6 @@ clean:
 
 backtest2:
 	source .venv/bin/activate && python -m ats.backtester2.run $(ARGS)
+
+install-rg:
+	bash tools/install_ripgrep.sh
