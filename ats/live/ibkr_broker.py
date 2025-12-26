@@ -1,166 +1,102 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional
-from uuid import uuid4
+import logging
+from typing import Dict, Optional, Sequence
 
-from .broker import BrokerState
-from .types import OrderFill, OrderRequest
+from ats.live.broker import Broker
+from ats.trader.order import Order
+
+log = logging.getLogger("ats.live.ibkr_broker")
 
 
-@dataclass
-class IBKRBroker:
-    """Interactive Brokers broker adapter via ib_insync.
+class IBKRBroker(Broker):
+    """IBKR broker adapter (lazy-imports ib_insync).
 
-    Phase 15.1 notes:
-    - This is intentionally minimal and intended for paper trading first.
-    - You must have TWS or IB Gateway running and API enabled.
-    - Dependency is optional: `pip install ib-insync`.
-
-    Environment variables (defaults shown):
-    - IBKR_HOST=127.0.0.1
-    - IBKR_PORT=7497 (paper) / 7496 (live)  (your setup may differ)
-    - IBKR_CLIENT_ID=1
-    - IBKR_ACCOUNT (optional; used for better account summary filtering)
-
-    Safety:
-    - The Live runner requires explicit `--execute` to place orders.
-    - For non-paper trading you should also gate with an additional allow-live flag in your own ops.
+    NOTE: This is intentionally minimal for Phase 15.
+    - Requires TWS or IB Gateway running
+    - Your CLI safety gate must be used: --execute requires --allow-live
     """
 
-    host: str = "127.0.0.1"
-    port: int = 7497
-    client_id: int = 1
-    account: Optional[str] = None
-    name: str = "ibkr"
-
-    _ib: object = field(default=None, init=False)
-
-    def connect(self) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 7,
+    ) -> None:
         try:
             from ib_insync import IB  # type: ignore
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
-                "ib_insync is not installed. Install it with: pip install ib-insync"
+                "ib_insync is not installed. Run: pip install ib-insync"
             ) from e
 
-        ib = IB()
-        ib.connect(self.host, int(self.port), clientId=int(self.client_id))
-        self._ib = ib
+        self._ib = IB()
+        self._ib.connect(host, int(port), clientId=int(client_id))
+        log.info(
+            "Connected to IBKR host=%s port=%s client_id=%s", host, port, client_id
+        )
 
-    def get_state(self) -> BrokerState:
-        if self._ib is None:
-            self.connect()
+    def get_positions(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for p in self._ib.positions():
+            sym = getattr(p.contract, "symbol", None)
+            if not sym:
+                continue
+            out[str(sym).upper()] = float(p.position)
+        return out
 
-        ib = self._ib
-
-        cash = 0.0
-        try:
-            summary = (
-                ib.accountSummary(account=self.account)
-                if self.account
-                else ib.accountSummary()
-            )
-            # accountSummary returns list of TagValue: (account, tag, value, currency)
-            for tv in summary:
-                if getattr(tv, "currency", None) not in (None, "", "USD"):
-                    continue
-                if tv.tag in ("AvailableFunds", "TotalCashValue", "CashBalance"):
-                    try:
-                        cash = float(tv.value)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            cash = 0.0
-
-        positions: Dict[str, float] = {}
-        try:
-            for p in ib.positions():
-                sym = getattr(p.contract, "symbol", None)
-                qty = float(p.position)
-                if sym:
-                    positions[sym] = positions.get(sym, 0.0) + qty
-        except Exception:
-            positions = {}
-
-        return BrokerState(cash=cash, positions=positions)
-
-    def place_order(
-        self, order: OrderRequest, price: float, timestamp: datetime
-    ) -> OrderFill:
-        if self._ib is None:
-            self.connect()
-
+    def place_order(self, order: Order, price: Optional[float] = None) -> None:
+        # price is ignored for IBKR (market orders)
         try:
             from ib_insync import MarketOrder, Stock  # type: ignore
         except Exception as e:  # pragma: no cover
-            raise RuntimeError(
-                "ib_insync is not installed. Install it with: pip install ib-insync"
-            ) from e
+            raise RuntimeError("ib_insync is not available") from e
 
-        ib = self._ib
-        action = "BUY" if order.side == "buy" else "SELL"
-
-        contract = Stock(order.symbol, "SMART", "USD")
-
-        qty = int(order.quantity)
+        sym = str(order.symbol).upper()
+        qty = float(order.size)
         if qty <= 0:
-            raise ValueError(f"IBKR quantity must be >= 1 share; got {order.quantity}")
+            return
 
+        side = str(order.side).lower()
+        action = "BUY" if side == "buy" else "SELL" if side == "sell" else None
+        if action is None:
+            raise ValueError(f"Unknown side: {order.side}")
+
+        contract = Stock(sym, "SMART", "USD")
+        self._ib.qualifyContracts(contract)
         ib_order = MarketOrder(action, qty)
-        trade = ib.placeOrder(contract, ib_order)
 
-        raw = {}
-        try:
-            raw = {
-                "permId": getattr(trade.order, "permId", None),
-                "orderId": getattr(trade.order, "orderId", None),
-                "status": getattr(trade.orderStatus, "status", None),
-            }
-        except Exception:
-            raw = {}
-
-        return OrderFill(
-            order_id=str(raw.get("orderId") or uuid4()),
-            symbol=order.symbol,
-            side=order.side,
-            quantity=float(qty),
-            price=float(price),
-            timestamp=timestamp,
-            broker=self.name,
-            raw=raw,
+        trade = self._ib.placeOrder(contract, ib_order)
+        log.info(
+            "IBKR ORDER %s %s qty=%.6f status=%s",
+            action,
+            sym,
+            qty,
+            trade.orderStatus.status,
         )
 
-    def flatten_all(
-        self, prices: Dict[str, float], timestamp: datetime
-    ) -> List[OrderFill]:
-        fills: List[OrderFill] = []
-        state = self.get_state()
-        for symbol, qty in state.positions.items():
-            px = float(prices.get(symbol, 0.0))
-            if px <= 0:
+    def flatten(
+        self,
+        prices: Dict[str, float],
+        symbols: Optional[Sequence[str]] = None,
+    ) -> None:
+        positions = self.get_positions()
+        universe = [s.upper() for s in symbols] if symbols else list(positions.keys())
+        for sym in universe:
+            qty = float(positions.get(sym, 0.0))
+            if abs(qty) < 1e-12:
                 continue
-            side = "sell" if qty > 0 else "buy"
-            fills.append(
+            if qty > 0:
                 self.place_order(
-                    OrderRequest(
-                        symbol=symbol,
-                        side=side,
-                        quantity=abs(qty),
-                        tag="kill_switch_flatten",
-                    ),
-                    price=px,
-                    timestamp=timestamp,
+                    Order(symbol=sym, side="sell", size=abs(qty), order_type="market")
                 )
-            )
-        return fills
+            else:
+                self.place_order(
+                    Order(symbol=sym, side="buy", size=abs(qty), order_type="market")
+                )
 
     def close(self) -> None:
-        if self._ib is not None:
-            try:
-                self._ib.disconnect()
-            except Exception:
-                pass
-            self._ib = None
+        try:
+            self._ib.disconnect()
+        except Exception:
+            return

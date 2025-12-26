@@ -2,37 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Literal, Optional
-
-Side = Literal["buy", "sell"]
-OrderType = Literal["market"]
+from typing import Any, Dict, Optional
 
 
 @dataclass(frozen=True)
-class PriceTick:
+class Bar:
     symbol: str
-    price: float
     timestamp: datetime
-    source: str = "unknown"
-
-
-@dataclass(frozen=True)
-class OrderRequest:
-    symbol: str
-    side: Side
-    quantity: float
-    order_type: OrderType = "market"
-    tif: str = "DAY"
-    tag: str = ""
-
-
-@dataclass(frozen=True)
-class OrderFill:
-    order_id: str
-    symbol: str
-    side: Side
-    quantity: float
-    price: float
-    timestamp: datetime
-    broker: str = "unknown"
-    raw: Optional[Dict[str, object]] = None
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+    vwap: Optional[float] = None
+    extra: Optional[Dict[str, Any]] = None

@@ -1,75 +1,139 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, Optional, Protocol
+import logging
+from datetime import datetime
+from typing import Dict, Optional, Protocol, Sequence
 
 import requests
 
-from .types import PriceTick
+from ats.live.types import Bar
+
+log = logging.getLogger("ats.live.market_data")
 
 
-class MarketDataProvider(Protocol):
-    """Minimal interface for polling market data."""
+class MarketData(Protocol):
+    def get_bars(self, symbols: Sequence[str]) -> Dict[str, Bar]:
+        raise NotImplementedError
 
-    def get_last_trade(self, symbol: str) -> PriceTick: ...
+    def close(self) -> None:
+        return
 
 
-@dataclass
+class MockMarketData:
+    def __init__(self, prices: Dict[str, float]) -> None:
+        self._prices: Dict[str, float] = {
+            k.upper(): float(v) for k, v in prices.items()
+        }
+        self._tick: int = 0
+
+    def get_bars(self, symbols: Sequence[str]) -> Dict[str, Bar]:
+        self._tick += 1
+        ts = datetime.utcnow()
+        out: Dict[str, Bar] = {}
+        for s in symbols:
+            sym = str(s).upper()
+            px = float(self._prices[sym])
+            out[sym] = Bar(
+                symbol=sym,
+                timestamp=ts,
+                open=px,
+                high=px,
+                low=px,
+                close=px,
+                volume=0.0,
+                vwap=None,
+                extra={"mock_tick": self._tick},
+            )
+        return out
+
+
 class PolygonMarketData:
-    """Polygon 'last trade' REST polling provider.
+    """Polygon snapshot poller (REST).
 
-    Requires POLYGON_API_KEY in the environment (recommended) or passed in.
+    Uses: /v2/snapshot/locale/us/markets/stocks/tickers/{ticker}
+
+    This returns a daily bar + last trade/quote. We treat lastTrade.p as "close".
     """
 
-    api_key: Optional[str] = None
-    timeout_seconds: float = 10.0
-    session: Optional[requests.Session] = None
-
-    def __post_init__(self) -> None:
-        if self.session is None:
-            self.session = requests.Session()
-
-    def get_last_trade(self, symbol: str) -> PriceTick:
-        import os
-
-        api_key = self.api_key or os.getenv("POLYGON_API_KEY")
+    def __init__(self, api_key: str, timeout_s: float = 10.0) -> None:
         if not api_key:
-            raise RuntimeError(
-                "Polygon API key not set. Set POLYGON_API_KEY env var (preferred) "
-                "or pass api_key=... to PolygonMarketData."
-            )
+            raise ValueError("POLYGON_API_KEY is required for market_data=polygon")
+        self._api_key = api_key
+        self._timeout_s = float(timeout_s)
+        self._session = requests.Session()
 
-        url = f"https://api.polygon.io/v2/last/trade/{symbol}"
-        resp = self.session.get(
-            url, params={"apiKey": api_key}, timeout=self.timeout_seconds
+    def _fetch_one(self, symbol: str) -> Bar:
+        sym = symbol.upper()
+        url = (
+            f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}"
+        )
+        resp = self._session.get(
+            url, params={"apiKey": self._api_key}, timeout=self._timeout_s
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # Polygon response expected: {"results": {"p": <price>, "t": <ns epoch>, ...}, ...}
         results = data.get("results") or {}
-        price = float(results["p"])
-        ts_ns = int(results["t"])
-        ts = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+        day = results.get("day") or {}
+        last_trade = results.get("lastTrade") or {}
 
-        return PriceTick(
-            symbol=symbol, price=price, timestamp=ts, source="polygon:last_trade"
+        # Best-effort parsing:
+        o = float(day.get("o") or 0.0)
+        h = float(day.get("h") or 0.0)
+        low = float(day.get("l") or 0.0)
+        v = float(day.get("v") or 0.0)
+        vw = day.get("vw")
+
+        last_price = last_trade.get("p")
+        if last_price is None:
+            last_price = day.get("c")
+        if last_price is None:
+            raise RuntimeError(f"Polygon snapshot missing price for {sym}")
+
+        close = float(last_price)
+
+        # Timestamp: if Polygon provides lastTrade.t, it's typically ms since epoch.
+        ts_val = last_trade.get("t")
+        ts = datetime.utcnow()
+        if ts_val is not None:
+            try:
+                ts = datetime.utcfromtimestamp(float(ts_val) / 1000.0)
+            except Exception:
+                ts = datetime.utcnow()
+
+        # If day fields are missing, fall back to close.
+        if o <= 0:
+            o = close
+        if h <= 0:
+            h = close
+        if low <= 0:
+            low = close
+
+        return Bar(
+            symbol=sym,
+            timestamp=ts,
+            open=o,
+            high=h,
+            low=low,
+            close=close,
+            volume=v,
+            vwap=float(vw) if vw is not None else None,
+            extra={"polygon_ticker": data.get("ticker")},
         )
 
+    def get_bars(self, symbols: Sequence[str]) -> Dict[str, Bar]:
+        out: Dict[str, Bar] = {}
+        for s in symbols:
+            sym = str(s).upper()
+            try:
+                out[sym] = self._fetch_one(sym)
+            except Exception as e:
+                log.exception("Polygon fetch failed for %s: %s", sym, e)
+                raise
+        return out
 
-@dataclass
-class StaticMarketData:
-    """In-memory deterministic provider useful for tests and demos."""
-
-    prices: Dict[str, float]
-    source: str = "static"
-
-    def get_last_trade(self, symbol: str) -> PriceTick:
-        px = float(self.prices[symbol])
-        return PriceTick(
-            symbol=symbol,
-            price=px,
-            timestamp=datetime.now(tz=timezone.utc),
-            source=self.source,
-        )
+    def close(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            return

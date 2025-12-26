@@ -1,31 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Protocol
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, Sequence
 
-from .types import OrderFill, OrderRequest
-
-
-@dataclass(frozen=True)
-class BrokerState:
-    cash: float
-    positions: Dict[str, float]
+from ats.trader.order import Order
 
 
-class Broker(Protocol):
-    """Minimal broker adapter interface for Phase 15.1."""
+class Broker(ABC):
+    @abstractmethod
+    def get_positions(self) -> Dict[str, float]:
+        """Return positions as {symbol: quantity}. Positive=long, negative=short."""
+        raise NotImplementedError
 
-    name: str
+    @abstractmethod
+    def place_order(self, order: Order, price: Optional[float] = None) -> None:
+        """Place an order. For paper broker, price is used for fills/cash simulation."""
+        raise NotImplementedError
 
-    def get_state(self) -> BrokerState: ...
+    @abstractmethod
+    def flatten(
+        self,
+        prices: Dict[str, float],
+        symbols: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Flatten positions for the given symbols (or all)."""
+        raise NotImplementedError
 
-    def place_order(
-        self, order: OrderRequest, price: float, timestamp: datetime
-    ) -> OrderFill: ...
-
-    def flatten_all(
-        self, prices: Dict[str, float], timestamp: datetime
-    ) -> List[OrderFill]: ...
-
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Optional cleanup hook."""
+        return

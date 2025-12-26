@@ -1,163 +1,150 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
-from ats.core.kill_switch import kill_switch_engaged
+from ats.live.broker import Broker
+from ats.live.config import LiveConfig
+from ats.live.ibkr_broker import IBKRBroker
+from ats.live.market_data import MockMarketData, PolygonMarketData
+from ats.live.paper_broker import PaperBroker
+from ats.live.strategies.analyst_ensemble import AnalystEnsembleStrategy
+from ats.live.strategies.buy_and_hold import BuyAndHoldStrategy
+from ats.live.strategy import LiveStrategy
+from ats.live.types import Bar
 
-from .broker import Broker
-from .config import LiveConfig
-from .market_data import MarketDataProvider, PolygonMarketData, StaticMarketData
-from .paper_broker import PaperBroker
-from .strategies.buy_and_hold import BuyAndHoldStrategy
-
-
-def _default_logger() -> logging.Logger:
-    logger = logging.getLogger("ats.live")
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
-        handler.setFormatter(fmt)
-        logger.addHandler(handler)
-    if logger.level == logging.NOTSET:
-        logger.setLevel(logging.INFO)
-    return logger
+log = logging.getLogger("ats.live.runner")
 
 
-@dataclass
-class LiveRunner:
-    config: LiveConfig
-    broker: Broker
-    market_data: MarketDataProvider
-    strategy: object  # Strategy protocol; keep loose to avoid runtime typing deps
-    logger: Optional[logging.Logger] = None
-    kill_switch_fn: Callable[[], bool] = kill_switch_engaged
-    sleep_fn: Callable[[float], None] = time.sleep
+def _kill_switch_enabled() -> bool:
+    # Prefer the global kill switch if present.
+    try:
+        from ats.core.kill_switch import is_kill_switch_enabled  # type: ignore
+    except Exception:
+        try:
+            from ats.backtester2.kill_switch import is_kill_switch_enabled  # type: ignore
+        except Exception:
+            return False
+    try:
+        return bool(is_kill_switch_enabled())
+    except Exception:
+        return False
 
-    def __post_init__(self) -> None:
-        if self.logger is None:
-            self.logger = _default_logger()
 
-    @classmethod
-    def from_config(cls, config: LiveConfig) -> "LiveRunner":
-        # Market data
-        if config.market_data == "polygon":
-            md: MarketDataProvider = PolygonMarketData()
-        elif config.market_data == "mock":
-            if not config.mock_prices:
-                raise ValueError(
-                    "market_data='mock' requires LiveConfig.mock_prices (e.g. {'AAPL': 200.0})."
-                )
-            md = StaticMarketData(prices=dict(config.mock_prices), source="mock")
-        else:
-            raise ValueError(f"Unknown market_data provider: {config.market_data}")
+def _build_market_data(cfg: LiveConfig):
+    if cfg.market_data == "mock":
+        if not cfg.mock_prices:
+            raise ValueError("mock_prices is required when market_data=mock")
+        return MockMarketData(cfg.mock_prices)
 
-        # Broker
-        if config.broker == "paper":
-            broker: Broker = PaperBroker()
-        elif config.broker == "ibkr":
-            from .ibkr_broker import IBKRBroker
+    if cfg.market_data == "polygon":
+        api_key = os.getenv("POLYGON_API_KEY", "")
+        return PolygonMarketData(api_key=api_key)
 
-            broker = IBKRBroker()
-        else:
-            raise ValueError(f"Unknown broker: {config.broker}")
+    raise ValueError(f"Unknown market_data: {cfg.market_data}")
 
-        # Strategy
-        if config.strategy == "buy_and_hold":
-            strat = BuyAndHoldStrategy(
-                notional_per_symbol=config.notional_per_symbol,
-                allow_fractional=config.allow_fractional,
-            )
-        else:
-            raise ValueError(f"Unknown strategy: {config.strategy}")
 
-        return cls(config=config, broker=broker, market_data=md, strategy=strat)
+def _build_broker(cfg: LiveConfig) -> Broker:
+    if cfg.broker == "paper":
+        return PaperBroker()
 
-    def run(self) -> None:
-        assert self.logger is not None
+    if cfg.broker == "ibkr":
+        host = os.getenv("IBKR_HOST", "127.0.0.1")
+        port = int(os.getenv("IBKR_PORT", "7497"))
+        client_id = int(os.getenv("IBKR_CLIENT_ID", "7"))
+        return IBKRBroker(host=host, port=port, client_id=client_id)
 
-        self.logger.info(
-            "LiveRunner starting (execute=%s, broker=%s, market_data=%s, symbols=%s, poll=%.2fs, max_ticks=%s)",
-            self.config.execute,
-            self.config.broker,
-            self.config.market_data,
-            ",".join(self.config.symbols),
-            self.config.poll_seconds,
-            self.config.max_ticks,
+    raise ValueError(f"Unknown broker: {cfg.broker}")
+
+
+def _build_strategy(cfg: LiveConfig) -> LiveStrategy:
+    if cfg.strategy == "buy_and_hold":
+        return BuyAndHoldStrategy(
+            notional_per_symbol=cfg.notional_per_symbol,
+            allow_fractional=cfg.allow_fractional,
         )
 
-        last_prices: Dict[str, float] = {}
-        tick_count = 0
+    if cfg.strategy == "analyst_ensemble":
+        return AnalystEnsembleStrategy(
+            notional_per_symbol=cfg.notional_per_symbol,
+            allow_fractional=cfg.allow_fractional,
+            history_bars=cfg.history_bars,
+            warmup_bars=cfg.warmup_bars,
+            min_confidence=cfg.min_confidence,
+            allow_short=cfg.allow_short,
+            rebalance_threshold_notional=cfg.rebalance_threshold_notional,
+            log_signals=cfg.log_signals,
+        )
 
+    raise ValueError(f"Unknown strategy: {cfg.strategy}")
+
+
+def run_live(cfg: LiveConfig) -> Broker:
+    """Run the live loop. Returns broker instance (useful for tests)."""
+    md = _build_market_data(cfg)
+    broker = _build_broker(cfg)
+    strat = _build_strategy(cfg)
+
+    log.info(
+        "LIVE START tag=%s strategy=%s market_data=%s broker=%s symbols=%s execute=%s poll=%.2fs max_ticks=%s",
+        cfg.run_tag,
+        cfg.strategy,
+        cfg.market_data,
+        cfg.broker,
+        ",".join(cfg.symbols),
+        cfg.execute,
+        cfg.poll_seconds,
+        str(cfg.max_ticks),
+    )
+
+    tick = 0
+    try:
+        while True:
+            if cfg.max_ticks is not None and tick >= int(cfg.max_ticks):
+                log.info("Reached max_ticks=%s; stopping.", cfg.max_ticks)
+                break
+
+            if _kill_switch_enabled():
+                log.error("KILL SWITCH ENABLED. Stopping live loop.")
+                if cfg.flatten_on_kill:
+                    # Best effort flatten using latest prices (if we can fetch them).
+                    try:
+                        bars = md.get_bars(cfg.symbols)
+                        prices = {s: float(b.close) for s, b in bars.items()}
+                        broker.flatten(prices=prices, symbols=cfg.symbols)
+                    except Exception:
+                        log.exception("Flatten on kill failed (best effort).")
+                break
+
+            bars: Dict[str, Bar] = md.get_bars(cfg.symbols)
+
+            orders = strat.on_tick(bars, broker)
+            if orders:
+                log.info("Generated %d orders", len(orders))
+
+            if cfg.execute:
+                for o in orders:
+                    sym = str(o.symbol).upper()
+                    px = float(bars[sym].close) if sym in bars else None
+                    broker.place_order(o, price=px)
+            else:
+                for o in orders:
+                    log.info("DRY-RUN order: %s", o)
+
+            tick += 1
+            if cfg.poll_seconds > 0:
+                time.sleep(float(cfg.poll_seconds))
+
+    finally:
         try:
-            while True:
-                if self.config.max_ticks is not None and tick_count >= int(
-                    self.config.max_ticks
-                ):
-                    self.logger.info(
-                        "Reached max_ticks=%s; stopping.", self.config.max_ticks
-                    )
-                    break
+            md.close()
+        except Exception:
+            pass
+        try:
+            broker.close()
+        except Exception:
+            pass
 
-                if self.kill_switch_fn():
-                    self.logger.warning("KILL SWITCH ENGAGED. Stopping live loop.")
-                    if self.config.flatten_on_kill and last_prices:
-                        ts = datetime.now(tz=timezone.utc)
-                        try:
-                            fills = self.broker.flatten_all(
-                                prices=last_prices, timestamp=ts
-                            )
-                            if fills:
-                                self.logger.warning(
-                                    "Flattened %d positions due to kill switch.",
-                                    len(fills),
-                                )
-                        except Exception as e:
-                            self.logger.exception("Flatten failed: %s", e)
-                    break
-
-                for symbol in self.config.symbols:
-                    try:
-                        tick = self.market_data.get_last_trade(symbol)
-                    except Exception as e:
-                        self.logger.warning("Market data error for %s: %s", symbol, e)
-                        continue
-
-                    last_prices[symbol] = tick.price
-
-                    state = self.broker.get_state()
-                    try:
-                        orders = self.strategy.generate_orders(tick, state)  # type: ignore[attr-defined]
-                    except Exception as e:
-                        self.logger.exception("Strategy error for %s: %s", symbol, e)
-                        continue
-
-                    for order in orders:
-                        if not self.config.execute:
-                            self.logger.info("DRY-RUN order: %s", order)
-                            continue
-                        try:
-                            fill = self.broker.place_order(
-                                order, price=tick.price, timestamp=tick.timestamp
-                            )
-                            self.logger.info("FILL: %s", fill)
-                        except Exception as e:
-                            self.logger.exception("Order failed (%s): %s", order, e)
-
-                tick_count += 1
-                self.sleep_fn(float(self.config.poll_seconds))
-
-        finally:
-            try:
-                self.broker.close()
-            except Exception:
-                pass
-            self.logger.info("LiveRunner stopped.")
-
-
-def run_live(config: LiveConfig) -> None:
-    """Convenience wrapper."""
-    LiveRunner.from_config(config).run()
+    return broker

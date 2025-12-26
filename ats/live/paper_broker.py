@@ -1,108 +1,91 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List
-from uuid import uuid4
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence
 
-from .broker import BrokerState
-from .types import OrderFill, OrderRequest
+from ats.live.broker import Broker
+from ats.trader.order import Order
+
+log = logging.getLogger("ats.live.paper_broker")
 
 
 @dataclass
-class PaperBroker:
-    """A simple in-memory paper broker.
+class PaperFill:
+    symbol: str
+    side: str
+    qty: float
+    price: float
 
-    - Executes at the provided tick price (no slippage in Phase 15.1).
-    - Enforces basic cash and position constraints.
+
+class PaperBroker(Broker):
+    """Very small paper broker for Phase 15.
+
+    - Tracks positions in-memory
+    - "Fills" at the provided price (usually the latest bar close)
     """
 
-    starting_cash: float = 10_000.0
-    name: str = "paper"
+    def __init__(self, starting_cash: float = 100_000.0) -> None:
+        self.cash: float = float(starting_cash)
+        self._positions: Dict[str, float] = {}
+        self.fills: List[PaperFill] = []
+        self.orders: List[Order] = []
 
-    _cash: float = field(init=False)
-    _positions: Dict[str, float] = field(default_factory=dict, init=False)
+    def get_positions(self) -> Dict[str, float]:
+        return dict(self._positions)
 
-    def __post_init__(self) -> None:
-        self._cash = float(self.starting_cash)
+    def place_order(self, order: Order, price: Optional[float] = None) -> None:
+        if price is None:
+            raise ValueError("PaperBroker requires a price for fills")
 
-    def get_state(self) -> BrokerState:
-        return BrokerState(cash=float(self._cash), positions=dict(self._positions))
-
-    def place_order(
-        self, order: OrderRequest, price: float, timestamp: datetime
-    ) -> OrderFill:
-        qty = float(order.quantity)
+        qty = float(order.size)
         if qty <= 0:
-            raise ValueError(f"Order quantity must be > 0, got {qty}")
+            return
 
-        px = float(price)
-        if px <= 0:
-            raise ValueError(f"Price must be > 0, got {px}")
+        side = str(order.side).lower()
+        sym = str(order.symbol).upper()
 
-        symbol = order.symbol
-        side = order.side
+        self.orders.append(order)
 
         if side == "buy":
-            cost = qty * px
-            if cost > self._cash + 1e-9:
-                raise ValueError(
-                    f"Insufficient cash for buy: need {cost:.2f}, have {self._cash:.2f}"
-                )
-            self._cash -= cost
-            self._positions[symbol] = self._positions.get(symbol, 0.0) + qty
+            self._positions[sym] = float(self._positions.get(sym, 0.0) + qty)
+            self.cash -= qty * float(price)
         elif side == "sell":
-            pos = self._positions.get(symbol, 0.0)
-            if qty > pos + 1e-9:
-                raise ValueError(
-                    f"Insufficient position for sell: sell {qty}, have {pos}"
-                )
-            self._cash += qty * px
-            new_pos = pos - qty
-            if abs(new_pos) < 1e-9:
-                self._positions.pop(symbol, None)
-            else:
-                self._positions[symbol] = new_pos
+            self._positions[sym] = float(self._positions.get(sym, 0.0) - qty)
+            self.cash += qty * float(price)
         else:
-            raise ValueError(f"Unknown side: {side}")
+            raise ValueError(f"Unknown side: {order.side}")
 
-        return OrderFill(
-            order_id=str(uuid4()),
-            symbol=symbol,
-            side=side,
-            quantity=qty,
-            price=px,
-            timestamp=timestamp,
-            broker=self.name,
-            raw={"tif": order.tif, "tag": order.tag, "order_type": order.order_type},
+        self.fills.append(PaperFill(symbol=sym, side=side, qty=qty, price=float(price)))
+        log.info(
+            "PAPER FILL %s %s qty=%.6f @ %.4f", side.upper(), sym, qty, float(price)
         )
 
-    def flatten_all(
-        self, prices: Dict[str, float], timestamp: datetime
-    ) -> List[OrderFill]:
-        fills: List[OrderFill] = []
-        # Copy keys so we can mutate _positions while iterating
-        for symbol, qty in list(self._positions.items()):
-            px = float(prices.get(symbol, 0.0))
-            if px <= 0:
-                # If we don't have a price, skip flattening that symbol.
+    def flatten(
+        self,
+        prices: Dict[str, float],
+        symbols: Optional[Sequence[str]] = None,
+    ) -> None:
+        universe = (
+            [s.upper() for s in symbols] if symbols else list(self._positions.keys())
+        )
+        for sym in universe:
+            qty = float(self._positions.get(sym, 0.0))
+            if abs(qty) < 1e-12:
                 continue
 
-            side = "sell" if qty > 0 else "buy"
-            fills.append(
-                self.place_order(
-                    OrderRequest(
-                        symbol=symbol,
-                        side=side,
-                        quantity=abs(qty),
-                        tag="kill_switch_flatten",
-                    ),
-                    price=px,
-                    timestamp=timestamp,
-                )
-            )
-        return fills
+            px = float(prices.get(sym, 0.0))
+            if px <= 0:
+                log.warning("No valid price to flatten %s; skipping", sym)
+                continue
 
-    def close(self) -> None:
-        # Nothing to close for a pure in-memory broker.
-        return
+            if qty > 0:
+                self.place_order(
+                    Order(symbol=sym, side="sell", size=abs(qty), order_type="market"),
+                    price=px,
+                )
+            else:
+                self.place_order(
+                    Order(symbol=sym, side="buy", size=abs(qty), order_type="market"),
+                    price=px,
+                )

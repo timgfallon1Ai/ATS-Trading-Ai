@@ -1,59 +1,51 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Set
+import logging
+from typing import Dict, List, Set
 
-from ..broker import BrokerState
-from ..types import OrderRequest, PriceTick
+from ats.live.broker import Broker
+from ats.live.strategy import LiveStrategy
+from ats.live.types import Bar
+from ats.trader.order import Order
+
+log = logging.getLogger("ats.live.strategies.buy_and_hold")
 
 
-@dataclass
-class BuyAndHoldStrategy:
-    """Phase 15.1 baseline strategy.
+class BuyAndHoldStrategy(LiveStrategy):
+    name = "buy_and_hold"
 
-    - For each symbol, buy once up to `notional_per_symbol` on the first time we see a tick.
-    - Never sells (hold forever).
-    """
+    def __init__(self, notional_per_symbol: float, allow_fractional: bool) -> None:
+        self.notional_per_symbol = float(notional_per_symbol)
+        self.allow_fractional = bool(allow_fractional)
+        self._bought: Set[str] = set()
 
-    notional_per_symbol: float = 100.0
-    allow_fractional: bool = False
-    _bought: Set[str] = field(default_factory=set, init=False)
+    def on_tick(self, bars: Dict[str, Bar], broker: Broker) -> List[Order]:
+        orders: List[Order] = []
 
-    def generate_orders(
-        self, tick: PriceTick, state: BrokerState
-    ) -> List[OrderRequest]:
-        symbol = tick.symbol
-        if symbol in self._bought:
-            return []
+        for sym, bar in bars.items():
+            sym = sym.upper()
+            if sym in self._bought:
+                continue
 
-        if tick.price <= 0:
-            return []
+            px = float(bar.close)
+            if px <= 0:
+                continue
 
-        # If we already have a position, treat as bought.
-        if abs(state.positions.get(symbol, 0.0)) > 1e-9:
-            self._bought.add(symbol)
-            return []
+            qty = self.notional_per_symbol / px
+            if not self.allow_fractional:
+                qty = float(int(qty))
 
-        # Conservative sizing: never exceed available cash in the state snapshot.
-        budget = min(float(self.notional_per_symbol), float(state.cash))
-        if budget <= 0:
-            return []
+            if qty <= 0:
+                log.info(
+                    "Skipping %s (notional %.2f too small vs price %.2f)",
+                    sym,
+                    self.notional_per_symbol,
+                    px,
+                )
+                self._bought.add(sym)
+                continue
 
-        qty = budget / float(tick.price)
-        if not self.allow_fractional:
-            qty = float(int(qty))
+            orders.append(Order(symbol=sym, side="buy", size=qty, order_type="market"))
+            self._bought.add(sym)
 
-        if qty <= 0:
-            return []
-
-        # Mark as bought optimistically; prevents repeat orders.
-        self._bought.add(symbol)
-
-        return [
-            OrderRequest(
-                symbol=symbol,
-                side="buy",
-                quantity=qty,
-                tag="phase15.1_buy_and_hold",
-            )
-        ]
+        return orders

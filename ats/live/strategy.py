@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from typing import List, Protocol
+from abc import ABC, abstractmethod
+from typing import Dict, List
 
-from .broker import BrokerState
-from .types import OrderRequest, PriceTick
+from ats.live.broker import Broker
+from ats.live.types import Bar
+from ats.trader.order import Order
 
 
-class Strategy(Protocol):
-    """Strategy interface used by the LiveRunner."""
+class LiveStrategy(ABC):
+    name: str
 
-    def generate_orders(
-        self, tick: PriceTick, state: BrokerState
-    ) -> List[OrderRequest]: ...
+    @abstractmethod
+    def on_tick(self, bars: Dict[str, Bar], broker: Broker) -> List[Order]:
+        raise NotImplementedError

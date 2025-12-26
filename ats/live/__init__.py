@@ -1,21 +1,14 @@
-"""Live trading components (Phase 15).
+from __future__ import annotations
 
-This package intentionally keeps a small, testable surface area:
-- Market data providers (polling-based in Phase 15.1)
-- Broker adapters (paper by default; IBKR optional)
-- Simple strategies and a runner loop
+"""Live trading runtime (Phase 15).
 
-NOTE: Nothing in here is financial advice. Use paper trading first.
+This package contains a safety-gated live runner:
+- Market data providers (Polygon or mock)
+- Broker adapters (paper or IBKR)
+- Live strategies (Phase15.1: buy_and_hold, Phase15.2: analyst_ensemble)
 """
 
-from .config import LiveConfig
-from .runner import LiveRunner
-from .types import OrderFill, OrderRequest, PriceTick
+from ats.live.config import LiveConfig
+from ats.live.runner import run_live
 
-__all__ = [
-    "LiveConfig",
-    "LiveRunner",
-    "OrderFill",
-    "OrderRequest",
-    "PriceTick",
-]
+__all__ = ["LiveConfig", "run_live"]
